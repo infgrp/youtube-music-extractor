@@ -1,0 +1,1238 @@
+"""
+YouTube Music Extractor
+-----------------------
+키워드로 유튜브 영상을 검색 -> 선택한 영상의 트랙리스트(챕터/설명) 추출 ->
+선택한 트랙만 각각 MP3 파일로 저장.
+
+필요:
+    pip install yt-dlp
+    ffmpeg 실행 파일이 PATH 에 있어야 함 (https://ffmpeg.org/)
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+import shutil
+import subprocess
+import threading
+import queue
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, font as tkfont
+from dataclasses import dataclass, field
+from typing import Optional
+
+from yt_dlp import YoutubeDL
+
+
+# ---------- Windows DPI 인식 (흐릿한 폰트 방지) ----------
+
+def _enable_dpi_awareness() -> None:
+    if sys.platform != "win32":
+        return
+    import ctypes
+    try:
+        # Per-Monitor v2 (Windows 10 1703+)
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)
+        return
+    except Exception:
+        pass
+    try:
+        # Per-Monitor
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+# ---------- 데이터 구조 ----------
+
+@dataclass
+class VideoItem:
+    video_id: str
+    title: str
+    uploader: str
+    duration: int  # seconds
+    url: str
+
+    def label(self) -> str:
+        mm, ss = divmod(self.duration or 0, 60)
+        hh, mm = divmod(mm, 60)
+        t = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh else f"{mm:02d}:{ss:02d}"
+        return f"[{t}] {self.title}  —  {self.uploader}"
+
+
+@dataclass
+class Track:
+    video: VideoItem
+    index: int
+    title: str
+    start: float          # seconds
+    end: Optional[float]  # seconds, None => 영상 끝까지
+
+    def label(self) -> str:
+        def fmt(s):
+            s = int(s)
+            mm, ss = divmod(s, 60)
+            hh, mm = divmod(mm, 60)
+            return f"{hh:02d}:{mm:02d}:{ss:02d}" if hh else f"{mm:02d}:{ss:02d}"
+        rng = f"{fmt(self.start)}-{fmt(self.end) if self.end else '끝'}"
+        return f"[{rng}] {self.title}  ({self.video.title[:40]})"
+
+
+# ---------- 유튜브 / 트랙리스트 파싱 ----------
+
+def _hms_to_seconds(text: str) -> Optional[int]:
+    parts = text.strip().split(":")
+    try:
+        parts = [int(p) for p in parts]
+    except ValueError:
+        return None
+    if len(parts) == 2:
+        m, s = parts
+        return m * 60 + s
+    if len(parts) == 3:
+        h, m, s = parts
+        return h * 3600 + m * 60 + s
+    return None
+
+
+TIMESTAMP_RE = re.compile(
+    r"""
+    (?P<ts>\d{1,2}:\d{2}(?::\d{2})?)    # 00:00 또는 00:00:00
+    """,
+    re.VERBOSE,
+)
+
+
+def parse_tracklist_from_description(description: str) -> list[tuple[str, int]]:
+    """설명에서 (제목, 시작초) 리스트를 추출. 순서는 타임스탬프 오름차순."""
+    if not description:
+        return []
+    results: list[tuple[str, int]] = []
+    for line in description.splitlines():
+        m = TIMESTAMP_RE.search(line)
+        if not m:
+            continue
+        secs = _hms_to_seconds(m.group("ts"))
+        if secs is None:
+            continue
+        # 타임스탬프 양쪽의 텍스트 중 더 긴 쪽을 제목으로
+        before = line[: m.start()].strip(" -–—·.•:·|[](){}")
+        after = line[m.end():].strip(" -–—·.•:·|[](){}")
+        # 선두의 트랙번호(1., 01), 1)) 제거
+        def clean_num(s: str) -> str:
+            return re.sub(r"^\s*\d{1,3}\s*[.)\]\-]\s*", "", s).strip()
+        title = clean_num(after) if len(after) >= len(before) else clean_num(before)
+        if not title:
+            continue
+        results.append((title, secs))
+    # 중복(같은 시작초) 제거 & 정렬
+    seen = set()
+    out = []
+    for t, s in sorted(results, key=lambda x: x[1]):
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append((t, s))
+    return out
+
+
+def extract_tracks(video: VideoItem, info: dict) -> list[Track]:
+    """info(yt-dlp extract_info 결과)에서 챕터 우선, 없으면 설명에서 트랙 파싱."""
+    tracks: list[Track] = []
+    chapters = info.get("chapters") or []
+    if chapters:
+        for i, ch in enumerate(chapters):
+            tracks.append(Track(
+                video=video,
+                index=i + 1,
+                title=ch.get("title") or f"Track {i+1}",
+                start=float(ch.get("start_time") or 0),
+                end=(float(ch["end_time"]) if ch.get("end_time") is not None else None),
+            ))
+        return tracks
+
+    parsed = parse_tracklist_from_description(info.get("description") or "")
+    duration = float(info.get("duration") or 0) or None
+    for i, (title, start) in enumerate(parsed):
+        end = float(parsed[i + 1][1]) if i + 1 < len(parsed) else duration
+        tracks.append(Track(video=video, index=i + 1, title=title,
+                            start=float(start), end=end))
+    return tracks
+
+
+# ---------- yt-dlp 래퍼 ----------
+
+class YtWrapper:
+    SEARCH_OPTS = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": "in_playlist",  # 검색 결과에는 메타데이터만
+    }
+    INFO_OPTS = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    }
+
+    @staticmethod
+    def search(keyword: str, n: int = 15) -> list[VideoItem]:
+        query = f"ytsearch{n}:{keyword}"
+        with YoutubeDL(YtWrapper.SEARCH_OPTS) as ydl:
+            info = ydl.extract_info(query, download=False)
+        entries = (info or {}).get("entries") or []
+        out = []
+        for e in entries:
+            if not e:
+                continue
+            vid = e.get("id") or ""
+            url = e.get("url") or (f"https://www.youtube.com/watch?v={vid}" if vid else "")
+            out.append(VideoItem(
+                video_id=vid,
+                title=e.get("title") or "(제목 없음)",
+                uploader=e.get("uploader") or e.get("channel") or "",
+                duration=int(e.get("duration") or 0),
+                url=url,
+            ))
+        return out
+
+    @staticmethod
+    def full_info(video: VideoItem) -> dict:
+        with YoutubeDL(YtWrapper.INFO_OPTS) as ydl:
+            return ydl.extract_info(video.url, download=False)
+
+    @staticmethod
+    def download_audio(video: VideoItem, out_dir: str, progress_hook=None) -> str:
+        """영상의 오디오를 m4a/webm 로 다운로드. 반환: 저장된 파일 경로."""
+        os.makedirs(out_dir, exist_ok=True)
+        outtmpl = os.path.join(out_dir, f"{video.video_id}.%(ext)s")
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "outtmpl": outtmpl,
+            "noplaylist": True,
+        }
+        if progress_hook:
+            opts["progress_hooks"] = [progress_hook]
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(video.url, download=True)
+            return ydl.prepare_filename(info)
+
+
+# ---------- ffmpeg 호출 ----------
+
+def ffmpeg_available() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+
+def _safe_filename(name: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:150] or "track"
+
+
+def split_to_mp3(source_path: str, track: Track, out_dir: str,
+                 start_offset: float = 0.0) -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    base = f"{track.index:02d} - {_safe_filename(track.title)}"
+    suffix = f" [{track.video.video_id}]" if track.video.video_id else ""
+    out_path = os.path.join(out_dir, f"{base}{suffix}.mp3")
+
+    # 앞 곡 꼬리가 섞이는 것을 방지하기 위해 경계 시각을 offset 만큼 뒤로 민다.
+    # 단, start=0 인 첫 트랙은 그대로(실제 0 부터 음악이 시작).
+    start = track.start + (start_offset if track.start > 0.0 else 0.0)
+    end = (track.end + start_offset) if track.end is not None else None
+
+    cmd = ["ffmpeg", "-y", "-loglevel", "error",
+           "-ss", f"{start:.3f}"]
+    if end is not None and end > start:
+        cmd += ["-t", f"{(end - start):.3f}"]
+    cmd += [
+        "-i", source_path,
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-b:a", "320k",
+        "-ar", "48000",
+        "-ac", "2",
+        "-id3v2_version", "3",
+        "-metadata", f"title={track.title}",
+        "-metadata", f"artist={track.video.uploader}",
+        "-metadata", f"album={track.video.title}",
+        "-metadata", f"track={track.index}",
+        out_path,
+    ]
+    subprocess.run(cmd, check=True)
+    return out_path
+
+
+# ---------- GUI ----------
+
+# ---------- 테마 색상 ----------
+
+COLORS = {
+    "bg":          "#eef1f6",   # 페이지 배경 (subtle cool gray)
+    "surface":     "#ffffff",   # 카드 배경
+    "surface_alt": "#f8fafc",   # 카드 안쪽 배경/헤더 영역
+    "text":        "#0f172a",   # slate-900
+    "text_sub":    "#334155",   # 보조 텍스트
+    "muted":       "#64748b",   # muted 텍스트
+    "border":      "#e2e8f0",   # slate-200
+    "border_str":  "#cbd5e1",   # slate-300
+    "primary":     "#4f46e5",   # indigo-600
+    "primary_h":   "#4338ca",   # indigo-700
+    "primary_l":   "#eef2ff",   # indigo-50 tint
+    "accent":      "#10b981",   # emerald-500
+    "accent_h":    "#059669",
+    "success":     "#059669",
+    "success_bg":  "#d1fae5",
+    "warn":        "#b45309",
+    "warn_bg":     "#fef3c7",
+    "danger":      "#dc2626",
+    "danger_bg":   "#fee2e2",
+    "info":        "#2563eb",
+    "info_bg":     "#dbeafe",
+    "zebra":       "#f8fafc",
+    "selection":   "#e0e7ff",   # indigo-100
+    "status_bg":   "#0f172a",   # slate-900
+    "status_bg2":  "#1e293b",
+    "status_fg":   "#e2e8f0",
+    "status_acc":  "#a5b4fc",   # indigo-300
+}
+
+
+class App(tk.Tk):
+    def __init__(self):
+        _enable_dpi_awareness()
+        super().__init__()
+        self.title("YouTube Music Extractor")
+        self.geometry("1180x820")
+        self.minsize(980, 640)
+        self.configure(bg=COLORS["bg"])
+
+        # DPI 에 맞춘 Tk 스케일링 (72pt = 1") — 흐릿한 폰트 방지
+        try:
+            dpi = self.winfo_fpixels("1i")
+            self.tk.call("tk", "scaling", max(1.0, dpi / 72.0))
+        except tk.TclError:
+            pass
+
+        # 기본 폰트 교체 — Windows 에서 Segoe UI Variable (있으면) → Segoe UI → 맑은 고딕
+        self._pick_fonts()
+
+        self.videos: list[VideoItem] = []
+        self.video_selected: dict[str, bool] = {}
+        self.tracks: list[Track] = []
+        self.track_selected: dict[int, bool] = {}
+        self.output_dir = tk.StringVar(
+            value=os.path.join(os.path.expanduser("~"), "Downloads", "YTMusic")
+        )
+        self.start_offset_var = tk.DoubleVar(value=0.25)
+        self.msg_queue: "queue.Queue[tuple]" = queue.Queue()
+
+        self._apply_styles()
+        self._build_ui()
+        self.after(100, self._pump_queue)
+
+    # ----- 폰트 -----
+
+    def _pick_fonts(self):
+        available = set(tkfont.families(self))
+
+        def pick(*candidates, fallback="TkDefaultFont"):
+            for c in candidates:
+                if c in available:
+                    return c
+            return fallback
+
+        # Windows 11: Segoe UI Variable Display/Text, 10: Segoe UI
+        self.F_UI = pick("Segoe UI Variable Display", "Segoe UI", "맑은 고딕",
+                         "Malgun Gothic", "Noto Sans KR", fallback="TkDefaultFont")
+        self.F_MONO = pick("JetBrains Mono", "Cascadia Mono", "Cascadia Code",
+                           "Consolas", fallback="TkFixedFont")
+
+        # 기본 tk 폰트들을 일괄 교체 (메시지박스/메뉴 등에도 적용)
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
+                     "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont",
+                     "TkIconFont", "TkTooltipFont"):
+            try:
+                f = tkfont.nametofont(name)
+                f.configure(family=self.F_UI, size=10)
+            except tk.TclError:
+                pass
+
+    # ----- 스타일 -----
+
+    def _apply_styles(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        C = COLORS
+        ui = self.F_UI
+
+        f_body  = (ui, 10)
+        f_bold  = (ui, 10, "bold")
+        f_small = (ui, 9)
+        f_hdr   = (ui, 11, "bold")
+        f_title = (ui, 18, "bold")
+        f_subtitle = (ui, 10)
+        f_badge = (ui, 9, "bold")
+
+        # 기본
+        style.configure(".", background=C["bg"], foreground=C["text"],
+                        font=f_body, borderwidth=0, focuscolor=C["primary"])
+        style.configure("TFrame", background=C["bg"])
+        style.configure("Surface.TFrame", background=C["surface"])
+        style.configure("SurfaceAlt.TFrame", background=C["surface_alt"])
+        style.configure("StatusBar.TFrame", background=C["status_bg"])
+
+        # 레이블
+        style.configure("TLabel", background=C["bg"], foreground=C["text"])
+        style.configure("Surface.TLabel", background=C["surface"], foreground=C["text"])
+        style.configure("SurfaceAlt.TLabel", background=C["surface_alt"], foreground=C["text"])
+        style.configure("Title.TLabel", background=C["bg"], foreground=C["text"],
+                        font=f_title)
+        style.configure("Subtitle.TLabel", background=C["bg"], foreground=C["muted"],
+                        font=f_subtitle)
+        style.configure("SectionHdr.TLabel", background=C["surface"],
+                        foreground=C["muted"], font=f_badge)
+        style.configure("Muted.TLabel", background=C["bg"], foreground=C["muted"],
+                        font=f_small)
+        style.configure("FieldLabel.TLabel", background=C["surface"],
+                        foreground=C["text_sub"], font=f_bold)
+
+        # 카드(라벨프레임)
+        style.configure("Card.TLabelframe",
+                        background=C["surface"],
+                        bordercolor=C["border"],
+                        lightcolor=C["border"],
+                        darkcolor=C["border"],
+                        relief="solid",
+                        borderwidth=1)
+        style.configure("Card.TLabelframe.Label",
+                        background=C["surface"],
+                        foreground=C["text"],
+                        font=f_hdr,
+                        padding=(10, 4))
+
+        # 버튼 — 기본(보조)
+        style.configure("TButton",
+                        background=C["surface"],
+                        foreground=C["text_sub"],
+                        bordercolor=C["border_str"],
+                        padding=(14, 9),
+                        borderwidth=1,
+                        relief="flat",
+                        focusthickness=0,
+                        font=f_bold)
+        style.map("TButton",
+                  background=[("active", "#f1f5f9"), ("pressed", "#e2e8f0"),
+                              ("disabled", "#f1f5f9")],
+                  foreground=[("disabled", C["muted"])],
+                  bordercolor=[("active", C["primary"]), ("focus", C["primary"])])
+
+        # 버튼 — Primary (indigo)
+        style.configure("Primary.TButton",
+                        background=C["primary"],
+                        foreground="white",
+                        bordercolor=C["primary"],
+                        padding=(18, 10),
+                        borderwidth=0,
+                        relief="flat",
+                        focusthickness=0,
+                        font=f_bold)
+        style.map("Primary.TButton",
+                  background=[("active", C["primary_h"]),
+                              ("pressed", C["primary_h"]),
+                              ("disabled", "#a5b4fc")],
+                  foreground=[("active", "white"), ("disabled", "#eef2ff")])
+
+        # 버튼 — Accent (emerald)
+        style.configure("Accent.TButton",
+                        background=C["accent"],
+                        foreground="white",
+                        bordercolor=C["accent"],
+                        padding=(18, 10),
+                        borderwidth=0,
+                        relief="flat",
+                        focusthickness=0,
+                        font=f_bold)
+        style.map("Accent.TButton",
+                  background=[("active", C["accent_h"]),
+                              ("pressed", C["accent_h"]),
+                              ("disabled", "#6ee7b7")],
+                  foreground=[("active", "white"), ("disabled", "#ecfdf5")])
+
+        # 버튼 — Danger (외곽선 스타일)
+        style.configure("Ghost.TButton",
+                        background=C["surface"],
+                        foreground=C["danger"],
+                        bordercolor=C["danger"],
+                        padding=(14, 9),
+                        borderwidth=1,
+                        relief="flat",
+                        font=f_bold)
+        style.map("Ghost.TButton",
+                  background=[("active", C["danger_bg"]),
+                              ("pressed", C["danger_bg"])])
+
+        # Entry / Spinbox
+        style.configure("TEntry",
+                        fieldbackground="white",
+                        foreground=C["text"],
+                        bordercolor=C["border_str"],
+                        lightcolor=C["border_str"],
+                        darkcolor=C["border_str"],
+                        insertcolor=C["primary"],
+                        padding=8)
+        style.map("TEntry",
+                  bordercolor=[("focus", C["primary"])],
+                  lightcolor=[("focus", C["primary"])],
+                  darkcolor=[("focus", C["primary"])])
+
+        style.configure("TSpinbox",
+                        fieldbackground="white",
+                        foreground=C["text"],
+                        bordercolor=C["border_str"],
+                        lightcolor=C["border_str"],
+                        darkcolor=C["border_str"],
+                        arrowcolor=C["text_sub"],
+                        padding=6,
+                        arrowsize=14)
+        style.map("TSpinbox", bordercolor=[("focus", C["primary"])])
+
+        # Treeview
+        style.configure("Treeview",
+                        background="white",
+                        fieldbackground="white",
+                        foreground=C["text"],
+                        rowheight=32,
+                        bordercolor=C["border"],
+                        borderwidth=0,
+                        relief="flat",
+                        font=f_body)
+        style.configure("Treeview.Heading",
+                        background=C["surface_alt"],
+                        foreground=C["muted"],
+                        bordercolor=C["border"],
+                        font=f_badge,
+                        padding=(10, 10),
+                        relief="flat")
+        style.map("Treeview.Heading",
+                  background=[("active", C["primary_l"])])
+        style.map("Treeview",
+                  background=[("selected", C["selection"])],
+                  foreground=[("selected", C["text"])])
+
+        # Progressbar
+        style.configure("Horizontal.TProgressbar",
+                        background=C["status_acc"],
+                        troughcolor=C["status_bg2"],
+                        bordercolor=C["status_bg2"],
+                        lightcolor=C["status_acc"],
+                        darkcolor=C["status_acc"],
+                        thickness=10)
+
+        # Scrollbar
+        style.configure("Vertical.TScrollbar",
+                        background=C["surface_alt"],
+                        troughcolor=C["surface"],
+                        bordercolor=C["border"],
+                        arrowcolor=C["muted"],
+                        lightcolor=C["surface_alt"],
+                        darkcolor=C["surface_alt"],
+                        gripcount=0,
+                        arrowsize=12,
+                        width=10)
+        style.map("Vertical.TScrollbar",
+                  background=[("active", C["border_str"])])
+
+        # Separator / Panedwindow
+        style.configure("TSeparator", background=C["border"])
+        style.configure("TPanedwindow", background=C["bg"])
+
+    # ----- UI 구성 -----
+
+    def _build_ui(self):
+        C = COLORS
+        ui = self.F_UI
+
+        # ── 헤더 ──
+        header = ttk.Frame(self, padding=(28, 20, 28, 6))
+        header.pack(fill="x")
+        brand = ttk.Frame(header)
+        brand.pack(side="left")
+
+        # 좌측 로고 블록 (indigo 뱃지)
+        badge = tk.Label(brand, text="♪", bg=C["primary"], fg="white",
+                         font=(ui, 18, "bold"), padx=14, pady=6)
+        badge.pack(side="left", padx=(0, 12))
+
+        ttext = ttk.Frame(brand)
+        ttext.pack(side="left")
+        ttk.Label(ttext, text="YouTube Music Extractor",
+                  style="Title.TLabel").pack(anchor="w")
+        ttk.Label(ttext,
+                  text="키워드로 검색한 영상의 트랙을 분리해 최고 음질 MP3로 저장합니다.",
+                  style="Subtitle.TLabel").pack(anchor="w")
+
+        # ── 검색 카드 ──
+        search_card = tk.Frame(self, bg=C["surface"],
+                               highlightbackground=C["border"],
+                               highlightthickness=1)
+        search_card.pack(fill="x", padx=28, pady=(14, 8))
+
+        inner = ttk.Frame(search_card, style="Surface.TFrame", padding=(18, 16))
+        inner.pack(fill="x")
+
+        ttk.Label(inner, text="검색어",
+                  style="FieldLabel.TLabel").grid(row=0, column=0, sticky="w")
+        self.keyword_var = tk.StringVar()
+        entry = ttk.Entry(inner, textvariable=self.keyword_var, font=(ui, 11))
+        entry.grid(row=1, column=0, sticky="we", padx=(0, 10), pady=(4, 0))
+        entry.bind("<Return>", lambda _e: self.on_search())
+
+        ttk.Label(inner, text="결과 개수",
+                  style="FieldLabel.TLabel").grid(row=0, column=1, sticky="w")
+        self.count_var = tk.IntVar(value=15)
+        ttk.Spinbox(inner, from_=5, to=50, width=6,
+                    textvariable=self.count_var, font=(ui, 11))\
+            .grid(row=1, column=1, sticky="w", padx=(0, 10), pady=(4, 0))
+
+        self.btn_search = ttk.Button(inner, text="검색",
+                                     style="Primary.TButton",
+                                     command=self.on_search)
+        self.btn_search.grid(row=1, column=2, sticky="we", pady=(4, 0))
+
+        # 2행: 저장 폴더, 오프셋
+        ttk.Label(inner, text="저장 폴더",
+                  style="FieldLabel.TLabel").grid(row=2, column=0, sticky="w",
+                                                   pady=(14, 0))
+        folder_row = ttk.Frame(inner, style="Surface.TFrame")
+        folder_row.grid(row=3, column=0, sticky="we",
+                        padx=(0, 10), pady=(4, 0))
+        folder_row.columnconfigure(0, weight=1)
+        ttk.Entry(folder_row, textvariable=self.output_dir, font=(ui, 10))\
+            .grid(row=0, column=0, sticky="we")
+        ttk.Button(folder_row, text="찾아보기", command=self.on_pick_dir)\
+            .grid(row=0, column=1, padx=(8, 0))
+
+        ttk.Label(inner, text="시작 오프셋(초)",
+                  style="FieldLabel.TLabel").grid(row=2, column=1, sticky="w",
+                                                   pady=(14, 0))
+        off_row = ttk.Frame(inner, style="Surface.TFrame")
+        off_row.grid(row=3, column=1, sticky="w", padx=(0, 10), pady=(4, 0))
+        ttk.Spinbox(off_row, from_=0.0, to=2.0, increment=0.05, width=6,
+                    textvariable=self.start_offset_var, format="%.2f",
+                    font=(ui, 11))\
+            .pack(side="left")
+        ttk.Label(off_row, text=" 앞 곡 꼬리 제거용",
+                  background=C["surface"], foreground=C["muted"],
+                  font=(ui, 9)).pack(side="left", padx=(6, 0))
+
+        inner.columnconfigure(0, weight=3)
+        inner.columnconfigure(1, weight=1)
+        inner.columnconfigure(2, weight=0)
+
+        # ── 본문: 좌(영상) / 우(트랙) ──
+        body = ttk.Panedwindow(self, orient="horizontal")
+        body.pack(fill="both", expand=True, padx=28, pady=(6, 6))
+
+        # ─── 좌: 검색 결과 카드 ───
+        left = tk.Frame(body, bg=C["surface"],
+                        highlightbackground=C["border"], highlightthickness=1)
+        body.add(left, weight=1)
+        self._build_list_header(left,
+            title="검색 결과",
+            hint="체크박스로 대상 선택 · 행 클릭 후 Delete 로 제거")
+
+        left_btns = ttk.Frame(left, style="Surface.TFrame")
+        left_btns.pack(side="bottom", fill="x", padx=14, pady=(6, 14))
+        ttk.Button(left_btns, text="전체 선택",
+                   command=lambda: self._toggle_all_videos(True)).pack(side="left", padx=(0, 6))
+        ttk.Button(left_btns, text="전체 해제",
+                   command=lambda: self._toggle_all_videos(False)).pack(side="left", padx=(0, 6))
+        ttk.Button(left_btns, text="목록에서 제거",
+                   style="Ghost.TButton",
+                   command=self.on_remove_videos).pack(side="left")
+        self.btn_extract = ttk.Button(left_btns, text="선택 영상 → 트랙 추출",
+                                      style="Primary.TButton",
+                                      command=self.on_extract_tracks)
+        self.btn_extract.pack(side="right")
+
+        tv_wrap_v = ttk.Frame(left, style="Surface.TFrame")
+        tv_wrap_v.pack(side="top", fill="both", expand=True,
+                       padx=14, pady=(0, 6))
+
+        cols_v = ("sel", "dur", "title", "uploader")
+        self.tv_videos = ttk.Treeview(tv_wrap_v, columns=cols_v, show="headings",
+                                       selectmode="extended")
+        for c, t in zip(cols_v, ("✓", "길이", "제목", "채널")):
+            self.tv_videos.heading(c, text=t)
+        self.tv_videos.column("sel", width=46, anchor="center", stretch=False)
+        self.tv_videos.column("dur", width=82, anchor="center", stretch=False)
+        self.tv_videos.column("title", width=380)
+        self.tv_videos.column("uploader", width=160)
+        vsb = ttk.Scrollbar(tv_wrap_v, orient="vertical",
+                            command=self.tv_videos.yview)
+        self.tv_videos.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.tv_videos.pack(side="left", fill="both", expand=True)
+        self.tv_videos.tag_configure("odd", background=C["zebra"])
+        self.tv_videos.tag_configure("even", background="white")
+        self.tv_videos.tag_configure("picked", background=C["primary_l"],
+                                     foreground=C["primary_h"])
+        self.tv_videos.bind("<Button-1>", self._on_video_single_click)
+        self.tv_videos.bind("<Double-1>", self._on_video_double_click)
+        self.tv_videos.bind("<Delete>", lambda _e: self.on_remove_videos())
+
+        # ─── 우: 트랙 카드 ───
+        right = tk.Frame(body, bg=C["surface"],
+                         highlightbackground=C["border"], highlightthickness=1)
+        body.add(right, weight=1)
+        self._build_list_header(right,
+            title="트랙",
+            hint="상태: ⏳ 대기 · ▶ 진행중 · ✓ 완료 · ✕ 실패")
+
+        right_btns = ttk.Frame(right, style="Surface.TFrame")
+        right_btns.pack(side="bottom", fill="x", padx=14, pady=(6, 14))
+        ttk.Button(right_btns, text="전체 선택",
+                   command=lambda: self._toggle_all_tracks(True)).pack(side="left", padx=(0, 6))
+        ttk.Button(right_btns, text="전체 해제",
+                   command=lambda: self._toggle_all_tracks(False)).pack(side="left", padx=(0, 6))
+        ttk.Button(right_btns, text="목록에서 제거",
+                   style="Ghost.TButton",
+                   command=self.on_remove_tracks).pack(side="left")
+        self.btn_download = ttk.Button(right_btns, text="선택 트랙 MP3 저장",
+                                       style="Accent.TButton",
+                                       command=self.on_download)
+        self.btn_download.pack(side="right")
+
+        tv_wrap_t = ttk.Frame(right, style="Surface.TFrame")
+        tv_wrap_t.pack(side="top", fill="both", expand=True,
+                       padx=14, pady=(0, 6))
+
+        cols_t = ("sel", "status", "range", "title", "source")
+        self.tv_tracks = ttk.Treeview(tv_wrap_t, columns=cols_t, show="headings",
+                                       selectmode="extended")
+        for c, t in zip(cols_t, ("✓", "상태", "구간", "트랙 제목", "원본 영상")):
+            self.tv_tracks.heading(c, text=t)
+        self.tv_tracks.column("sel", width=46, anchor="center", stretch=False)
+        self.tv_tracks.column("status", width=100, anchor="center", stretch=False)
+        self.tv_tracks.column("range", width=130, anchor="center", stretch=False)
+        self.tv_tracks.column("title", width=260)
+        self.tv_tracks.column("source", width=200)
+        vsb2 = ttk.Scrollbar(tv_wrap_t, orient="vertical",
+                             command=self.tv_tracks.yview)
+        self.tv_tracks.configure(yscrollcommand=vsb2.set)
+        vsb2.pack(side="right", fill="y")
+        self.tv_tracks.pack(side="left", fill="both", expand=True)
+        self.tv_tracks.tag_configure("odd",  background=C["zebra"])
+        self.tv_tracks.tag_configure("even", background="white")
+        self.tv_tracks.tag_configure("pending", background="white",
+                                     foreground=C["muted"])
+        self.tv_tracks.tag_configure("running", background=C["info_bg"],
+                                     foreground=C["primary_h"])
+        self.tv_tracks.tag_configure("done", background=C["success_bg"],
+                                     foreground=C["success"])
+        self.tv_tracks.tag_configure("failed", background=C["danger_bg"],
+                                     foreground=C["danger"])
+        self.tv_tracks.bind("<Button-1>", self._on_track_click)
+        self.tv_tracks.bind("<Double-1>", self._on_track_double_click)
+        self.tv_tracks.bind("<Delete>", lambda _e: self.on_remove_tracks())
+
+        # ── 다크 푸터 상태 바 ──
+        bottom = tk.Frame(self, bg=C["status_bg"])
+        bottom.pack(fill="x", side="bottom")
+
+        # 상단 라인: stage • detail
+        line1 = tk.Frame(bottom, bg=C["status_bg"])
+        line1.pack(fill="x", padx=28, pady=(14, 6))
+
+        self.stage_var = tk.StringVar(value="●  준비")
+        tk.Label(line1, textvariable=self.stage_var,
+                 bg=C["status_bg"], fg=C["status_acc"],
+                 font=(ui, 10, "bold")).pack(side="left")
+
+        self.progress_label_var = tk.StringVar(value="")
+        tk.Label(line1, textvariable=self.progress_label_var,
+                 bg=C["status_bg"], fg=C["status_fg"],
+                 font=(self.F_MONO, 9)).pack(side="right")
+
+        # 진행 바
+        self.progress = ttk.Progressbar(bottom, mode="determinate",
+                                        maximum=100, value=0)
+        self.progress.pack(fill="x", padx=28, pady=(0, 6))
+
+        # 하단 라인: 상태 메시지
+        self.status_var = tk.StringVar(value="키워드를 입력하고 검색을 시작하세요.")
+        tk.Label(bottom, textvariable=self.status_var,
+                 bg=C["status_bg"], fg=C["status_fg"],
+                 anchor="w", padx=28, font=(ui, 9))\
+            .pack(fill="x", pady=(0, 14))
+
+    def _build_list_header(self, parent, title: str, hint: str):
+        """카드 상단에 섹션 제목 + 보조 설명."""
+        C = COLORS
+        ui = self.F_UI
+        hdr = ttk.Frame(parent, style="Surface.TFrame")
+        hdr.pack(side="top", fill="x", padx=14, pady=(14, 6))
+        tk.Label(hdr, text=title, bg=C["surface"], fg=C["text"],
+                 font=(ui, 12, "bold")).pack(side="left")
+        tk.Label(hdr, text="   " + hint, bg=C["surface"], fg=C["muted"],
+                 font=(ui, 9)).pack(side="left")
+        # 구분선
+        tk.Frame(parent, bg=C["border"], height=1)\
+            .pack(side="top", fill="x", padx=14)
+
+    # ----- 이벤트: 검색 -----
+
+    def on_pick_dir(self):
+        d = filedialog.askdirectory(initialdir=self.output_dir.get() or ".")
+        if d:
+            self.output_dir.set(d)
+
+    def on_search(self):
+        kw = self.keyword_var.get().strip()
+        if not kw:
+            messagebox.showwarning("알림", "키워드를 입력하세요.")
+            return
+        n = int(self.count_var.get())
+        self._start_busy("● 검색 중", f"'{kw}' 검색 중...")
+        self.btn_search.config(state="disabled")
+
+        def work():
+            try:
+                items = YtWrapper.search(kw, n)
+                self.msg_queue.put(("search_done", items))
+            except Exception as e:
+                self.msg_queue.put(("error", f"검색 실패: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _populate_videos(self, items: list[VideoItem]):
+        self.tv_videos.delete(*self.tv_videos.get_children())
+        self.videos = items
+        self.video_selected = {v.video_id: False for v in items}
+        for i, v in enumerate(items):
+            mm, ss = divmod(v.duration or 0, 60)
+            hh, mm = divmod(mm, 60)
+            dur = f"{hh:d}:{mm:02d}:{ss:02d}" if hh else f"{mm:02d}:{ss:02d}"
+            self.tv_videos.insert("", "end", iid=v.video_id,
+                                  values=("☐", dur, v.title, v.uploader),
+                                  tags=("odd" if i % 2 else "even",))
+
+    def _on_video_single_click(self, event):
+        if self.tv_videos.identify("region", event.x, event.y) != "cell":
+            return
+        if self.tv_videos.identify_column(event.x) != "#1":
+            return
+        iid = self.tv_videos.identify_row(event.y)
+        if iid:
+            self._toggle_video(iid)
+
+    def _on_video_double_click(self, event):
+        if self.tv_videos.identify("region", event.x, event.y) != "cell":
+            return
+        iid = self.tv_videos.identify_row(event.y)
+        if iid:
+            self._toggle_video(iid)
+
+    def _video_row_tag(self, v: VideoItem, idx: int) -> str:
+        if self.video_selected.get(v.video_id):
+            return "picked"
+        return "odd" if idx % 2 else "even"
+
+    def _refresh_video_row(self, v: VideoItem, idx: int):
+        picked = self.video_selected.get(v.video_id, False)
+        vals = list(self.tv_videos.item(v.video_id, "values"))
+        vals[0] = "☑" if picked else "☐"
+        self.tv_videos.item(v.video_id, values=vals,
+                            tags=(self._video_row_tag(v, idx),))
+
+    def _toggle_video(self, video_id: str):
+        cur = self.video_selected.get(video_id, False)
+        self.video_selected[video_id] = not cur
+        idx = next((i for i, v in enumerate(self.videos) if v.video_id == video_id), 0)
+        self._refresh_video_row(self.videos[idx], idx)
+
+    def _toggle_all_videos(self, on: bool):
+        for i, v in enumerate(self.videos):
+            self.video_selected[v.video_id] = on
+            self._refresh_video_row(v, i)
+
+    def on_remove_videos(self):
+        # 1순위: 트리에서 하이라이트된 행, 2순위: 체크된 행
+        targets = set(self.tv_videos.selection())
+        if not targets:
+            targets = {v.video_id for v in self.videos
+                       if self.video_selected.get(v.video_id)}
+        if not targets:
+            messagebox.showwarning(
+                "알림",
+                "제거할 영상을 행 클릭으로 하이라이트하거나 체크하세요."
+            )
+            return
+        for vid in targets:
+            if self.tv_videos.exists(vid):
+                self.tv_videos.delete(vid)
+            self.video_selected.pop(vid, None)
+        self.videos = [v for v in self.videos if v.video_id not in targets]
+        # 지브라 패턴 다시 적용
+        for i, v in enumerate(self.videos):
+            self._refresh_video_row(v, i)
+        self.status_var.set(f"영상 {len(targets)}개를 목록에서 제거했습니다.")
+
+    # ----- 이벤트: 트랙 추출 -----
+
+    def on_extract_tracks(self):
+        chosen = [v for v in self.videos if self.video_selected.get(v.video_id)]
+        if not chosen:
+            messagebox.showwarning("알림", "영상을 하나 이상 선택하세요.")
+            return
+        self._start_busy("● 트랙 추출 중",
+                         f"{len(chosen)}개 영상에서 트랙을 가져오는 중...")
+        self.btn_extract.config(state="disabled")
+
+        def work():
+            all_tracks: list[Track] = []
+            # 트랙리스트/챕터가 전혀 없어 처리 불가한 영상
+            no_tracks: list[tuple[str, str]] = []  # (video_id, title)
+            for i, v in enumerate(chosen, 1):
+                self.msg_queue.put(("stage",
+                    f"● 트랙 정보 수집  ·  {i} / {len(chosen)}"))
+                self.msg_queue.put(("status",
+                    f"트랙 추출 중 ({i}/{len(chosen)}): {v.title}"))
+                try:
+                    info = YtWrapper.full_info(v)
+                    tks = extract_tracks(v, info)
+                    if not tks:
+                        no_tracks.append((v.video_id, v.title))
+                        continue
+                    all_tracks.extend(tks)
+                except Exception as e:
+                    self.msg_queue.put(("warn", f"'{v.title}' 추출 실패: {e}"))
+            self.msg_queue.put(("tracks_done", (all_tracks, no_tracks)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _populate_tracks(self, tracks: list[Track]):
+        self.tv_tracks.delete(*self.tv_tracks.get_children())
+        self.tracks = tracks
+        self.track_selected = {i: False for i in range(len(tracks))}
+        self.track_status: dict[int, str] = {i: "" for i in range(len(tracks))}
+        for i, t in enumerate(tracks):
+            def fmt(s):
+                if s is None:
+                    return "끝"
+                s = int(s)
+                mm, ss = divmod(s, 60)
+                hh, mm = divmod(mm, 60)
+                return f"{hh:02d}:{mm:02d}:{ss:02d}" if hh else f"{mm:02d}:{ss:02d}"
+            rng = f"{fmt(t.start)}~{fmt(t.end)}"
+            self.tv_tracks.insert("", "end", iid=str(i),
+                                  values=("☐", "", rng, t.title, t.video.title),
+                                  tags=("odd" if i % 2 else "even",))
+
+    def _on_track_click(self, event):
+        region = self.tv_tracks.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        col = self.tv_tracks.identify_column(event.x)
+        if col != "#1":
+            return
+        iid = self.tv_tracks.identify_row(event.y)
+        if not iid:
+            return
+        self._toggle_track(int(iid))
+
+    def _on_track_double_click(self, event):
+        if self.tv_tracks.identify("region", event.x, event.y) != "cell":
+            return
+        iid = self.tv_tracks.identify_row(event.y)
+        if iid:
+            self._toggle_track(int(iid))
+
+    _STATUS_LABEL = {
+        "": "",
+        "pending": "⏳ 대기",
+        "running": "▶ 진행중",
+        "done":    "✓ 완료",
+        "failed":  "✕ 실패",
+    }
+
+    def _row_tag(self, idx: int) -> str:
+        st = self.track_status.get(idx, "") if hasattr(self, "track_status") else ""
+        if st in ("pending", "running", "done", "failed"):
+            return st
+        return "odd" if idx % 2 else "even"
+
+    def _refresh_track_row(self, idx: int):
+        picked = self.track_selected.get(idx, False)
+        st = self.track_status.get(idx, "") if hasattr(self, "track_status") else ""
+        vals = list(self.tv_tracks.item(str(idx), "values"))
+        vals[0] = "☑" if picked else "☐"
+        vals[1] = self._STATUS_LABEL.get(st, "")
+        self.tv_tracks.item(str(idx), values=vals, tags=(self._row_tag(idx),))
+
+    def _set_track_status(self, idx: int, status: str):
+        if not hasattr(self, "track_status"):
+            return
+        self.track_status[idx] = status
+        self._refresh_track_row(idx)
+        # 진행중 트랙은 보이도록 스크롤
+        if status == "running":
+            try:
+                self.tv_tracks.see(str(idx))
+            except tk.TclError:
+                pass
+
+    def _toggle_track(self, idx: int):
+        cur = self.track_selected.get(idx, False)
+        self.track_selected[idx] = not cur
+        self._refresh_track_row(idx)
+
+    def _toggle_all_tracks(self, on: bool):
+        for i in range(len(self.tracks)):
+            self.track_selected[i] = on
+            self._refresh_track_row(i)
+
+    def on_remove_tracks(self):
+        if not self.tracks:
+            return
+        # 1순위: 트리에서 하이라이트된 행, 2순위: 체크된 행
+        try:
+            targets = {int(iid) for iid in self.tv_tracks.selection()}
+        except ValueError:
+            targets = set()
+        if not targets:
+            targets = {i for i, on in self.track_selected.items() if on}
+        if not targets:
+            messagebox.showwarning(
+                "알림",
+                "제거할 트랙을 행 클릭으로 하이라이트하거나 체크하세요."
+            )
+            return
+
+        # 체크 상태/진행 상태 보존하며 인덱스 재작성
+        survivors = [i for i in range(len(self.tracks)) if i not in targets]
+        new_tracks = [self.tracks[i] for i in survivors]
+        saved_sel = {new_i: self.track_selected.get(old_i, False)
+                     for new_i, old_i in enumerate(survivors)}
+        saved_st = {new_i: self.track_status.get(old_i, "")
+                    for new_i, old_i in enumerate(survivors)}
+
+        removed = len(targets)
+        self._populate_tracks(new_tracks)
+        self.track_selected = saved_sel
+        self.track_status = saved_st
+        for i in range(len(new_tracks)):
+            self._refresh_track_row(i)
+        self.status_var.set(f"트랙 {removed}개를 목록에서 제거했습니다.")
+
+    # ----- 이벤트: 다운로드/추출 -----
+
+    def on_download(self):
+        if not ffmpeg_available():
+            messagebox.showerror(
+                "ffmpeg 없음",
+                "ffmpeg 실행 파일을 PATH 에서 찾을 수 없습니다.\n"
+                "https://ffmpeg.org/ 에서 설치 후 다시 시도하세요."
+            )
+            return
+        chosen_idx = [i for i, on in self.track_selected.items() if on]
+        if not chosen_idx:
+            messagebox.showwarning("알림", "트랙을 하나 이상 선택하세요.")
+            return
+        out_dir = self.output_dir.get().strip()
+        if not out_dir:
+            messagebox.showwarning("알림", "저장 폴더를 지정하세요.")
+            return
+
+        chosen_pairs = [(i, self.tracks[i]) for i in chosen_idx]
+        # 모든 선택 트랙을 '대기'로 표시
+        for idx, _ in chosen_pairs:
+            self._set_track_status(idx, "pending")
+
+        # 영상별로 그룹화 (같은 원본을 한 번만 다운로드)
+        groups: dict[str, list[tuple[int, Track]]] = {}
+        for idx, t in chosen_pairs:
+            groups.setdefault(t.video.video_id, []).append((idx, t))
+
+        total = len(chosen_pairs)
+        offset = max(0.0, float(self.start_offset_var.get() or 0.0))
+
+        self.msg_queue.put(("stage", f"● 다운로드 & MP3 추출  (0 / {total})"))
+        self.msg_queue.put(("progress_set", (0.0, "")))
+        self.btn_download.config(state="disabled")
+        self.btn_search.config(state="disabled")
+        self.btn_extract.config(state="disabled")
+
+        def work():
+            done = 0
+            tmp_dir = os.path.join(out_dir, "_tmp_audio")
+            os.makedirs(tmp_dir, exist_ok=True)
+
+            def make_hook():
+                def hook(d):
+                    st = d.get("status")
+                    if st == "downloading":
+                        total_b = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                        got = d.get("downloaded_bytes") or 0
+                        pct = (got / total_b * 100.0) if total_b else 0.0
+                        speed = d.get("speed") or 0
+                        txt = f"{got/1_000_000:.1f} / {total_b/1_000_000:.1f} MB  ·  {speed/1_000_000:.1f} MB/s" if total_b else f"{got/1_000_000:.1f} MB"
+                        self.msg_queue.put(("download_progress", (pct, txt)))
+                    elif st == "finished":
+                        self.msg_queue.put(("download_progress", (100.0, "다운로드 완료, 처리 중...")))
+                return hook
+
+            try:
+                for pairs in groups.values():
+                    video = pairs[0][1].video
+                    self.msg_queue.put(("status", f"원본 오디오 다운로드: {video.title}"))
+                    self.msg_queue.put(("stage",
+                        f"● 원본 다운로드 중  ·  {video.title[:60]}"))
+                    try:
+                        src = YtWrapper.download_audio(
+                            video, tmp_dir, progress_hook=make_hook()
+                        )
+                    except Exception as e:
+                        self.msg_queue.put(("warn", f"다운로드 실패 '{video.title}': {e}"))
+                        for idx, _ in pairs:
+                            self.msg_queue.put(("track_status", (idx, "failed")))
+                        continue
+
+                    for idx, t in pairs:
+                        done += 1
+                        self.msg_queue.put(("track_status", (idx, "running")))
+                        self.msg_queue.put(("status",
+                            f"MP3 추출 ({done}/{total}): {t.title}"))
+                        self.msg_queue.put(("stage",
+                            f"● MP3 추출 중  ·  {done} / {total}"))
+                        self.msg_queue.put(("overall_progress",
+                            ((done - 1) / total * 100.0)))
+                        try:
+                            split_to_mp3(src, t, out_dir, start_offset=offset)
+                            self.msg_queue.put(("track_status", (idx, "done")))
+                        except subprocess.CalledProcessError as e:
+                            self.msg_queue.put(("warn",
+                                f"MP3 실패 '{t.title}': ffmpeg 종료코드 {e.returncode}"))
+                            self.msg_queue.put(("track_status", (idx, "failed")))
+                        except Exception as e:
+                            self.msg_queue.put(("warn", f"MP3 실패 '{t.title}': {e}"))
+                            self.msg_queue.put(("track_status", (idx, "failed")))
+                        self.msg_queue.put(("overall_progress",
+                            (done / total * 100.0)))
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            self.msg_queue.put(("download_done", out_dir))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ----- 진행/상태 -----
+
+    def _start_busy(self, stage_text: str, status_text: str = ""):
+        self.stage_var.set(stage_text)
+        if status_text:
+            self.status_var.set(status_text)
+        self.progress.configure(mode="indeterminate")
+        self.progress.start(12)
+
+    def _stop_busy(self, stage_text: str, status_text: str = ""):
+        self.progress.stop()
+        self.progress.configure(mode="determinate", value=0)
+        self.progress_label_var.set("")
+        self.stage_var.set(stage_text)
+        if status_text:
+            self.status_var.set(status_text)
+
+    def _pump_queue(self):
+        try:
+            while True:
+                kind, payload = self.msg_queue.get_nowait()
+                if kind == "search_done":
+                    self._populate_videos(payload)
+                    self._stop_busy("● 준비", f"검색 완료: {len(payload)}건")
+                    self.btn_search.config(state="normal")
+                elif kind == "tracks_done":
+                    tracks, no_tracks = payload
+                    # 트랙리스트 없는 영상을 검색 결과에서 제거
+                    if no_tracks:
+                        bad_ids = {vid for vid, _ in no_tracks}
+                        for vid in bad_ids:
+                            if self.tv_videos.exists(vid):
+                                self.tv_videos.delete(vid)
+                            self.video_selected.pop(vid, None)
+                        self.videos = [v for v in self.videos
+                                        if v.video_id not in bad_ids]
+                        for i, v in enumerate(self.videos):
+                            self._refresh_video_row(v, i)
+                    self._populate_tracks(tracks)
+                    msg = f"트랙 추출 완료: {len(tracks)}건"
+                    if no_tracks:
+                        msg += f"  ·  처리 불가 영상 {len(no_tracks)}개 제거"
+                    self._stop_busy("● 준비", msg)
+                    self.btn_extract.config(state="normal")
+                    if no_tracks:
+                        sample = "\n".join(f"• {t[:60]}"
+                                            for _, t in no_tracks[:10])
+                        if len(no_tracks) > 10:
+                            sample += f"\n... 외 {len(no_tracks) - 10}개"
+                        messagebox.showinfo(
+                            "처리 불가 영상 제거",
+                            "챕터 또는 설명 타임스탬프 기반 트랙리스트가 없어\n"
+                            f"처리할 수 없는 영상 {len(no_tracks)}개를 "
+                            f"검색 결과에서 제거했습니다.\n\n{sample}"
+                        )
+                elif kind == "download_done":
+                    self.progress.configure(mode="determinate", value=100)
+                    self.progress_label_var.set("")
+                    self.stage_var.set("● 완료")
+                    self.status_var.set(f"완료. 저장 폴더: {payload}")
+                    self.btn_download.config(state="normal")
+                    self.btn_search.config(state="normal")
+                    self.btn_extract.config(state="normal")
+                    messagebox.showinfo("완료", f"MP3 저장이 끝났습니다.\n{payload}")
+                elif kind == "stage":
+                    self.stage_var.set(payload)
+                elif kind == "status":
+                    self.status_var.set(payload)
+                elif kind == "warn":
+                    self.status_var.set(payload)
+                elif kind == "download_progress":
+                    pct, txt = payload
+                    self.progress.configure(mode="determinate", value=pct)
+                    self.progress_label_var.set(txt)
+                elif kind == "overall_progress":
+                    self.progress.configure(mode="determinate", value=payload)
+                elif kind == "progress_set":
+                    pct, txt = payload
+                    self.progress.configure(mode="determinate", value=pct)
+                    self.progress_label_var.set(txt)
+                elif kind == "track_status":
+                    idx, status = payload
+                    self._set_track_status(idx, status)
+                elif kind == "error":
+                    self._stop_busy("● 오류", payload)
+                    self.btn_search.config(state="normal")
+                    self.btn_extract.config(state="normal")
+                    self.btn_download.config(state="normal")
+                    messagebox.showerror("오류", payload)
+        except queue.Empty:
+            pass
+        self.after(120, self._pump_queue)
+
+
+if __name__ == "__main__":
+    App().mainloop()
