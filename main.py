@@ -51,6 +51,14 @@ def _enable_dpi_awareness() -> None:
         pass
 
 
+# ---------- 상수 ----------
+
+# 챕터/설명 타임스탬프가 없을 때 이 길이(초) 이하면 단일곡으로 간주하고
+# 영상 전체를 한 트랙으로 추출한다. 이보다 길면 트랙리스트가 없는
+# 컴필레이션/믹스로 판단해 검색 결과에서 필터링한다.
+SINGLE_TRACK_MAX_SEC = 15 * 60  # 15분
+
+
 # ---------- 데이터 구조 ----------
 
 @dataclass
@@ -144,8 +152,10 @@ def parse_tracklist_from_description(description: str) -> list[tuple[str, int]]:
     return out
 
 
-def extract_tracks(video: VideoItem, info: dict) -> list[Track]:
-    """info(yt-dlp extract_info 결과)에서 챕터 우선, 없으면 설명에서 트랙 파싱."""
+def extract_tracks(video: VideoItem, info: dict,
+                    single_track_max_sec: float = SINGLE_TRACK_MAX_SEC
+                    ) -> list[Track]:
+    """info(yt-dlp extract_info 결과)에서 챕터 → 설명 파싱 → 단일 트랙 순으로 폴백."""
     tracks: list[Track] = []
     chapters = info.get("chapters") or []
     if chapters:
@@ -161,10 +171,24 @@ def extract_tracks(video: VideoItem, info: dict) -> list[Track]:
 
     parsed = parse_tracklist_from_description(info.get("description") or "")
     duration = float(info.get("duration") or 0) or None
-    for i, (title, start) in enumerate(parsed):
-        end = float(parsed[i + 1][1]) if i + 1 < len(parsed) else duration
-        tracks.append(Track(video=video, index=i + 1, title=title,
-                            start=float(start), end=end))
+    if parsed:
+        for i, (title, start) in enumerate(parsed):
+            end = float(parsed[i + 1][1]) if i + 1 < len(parsed) else duration
+            tracks.append(Track(video=video, index=i + 1, title=title,
+                                start=float(start), end=end))
+        return tracks
+
+    # 챕터도 설명 타임스탬프도 없음.
+    # 길이가 single_track_max_sec 이하면 단일곡으로 간주해 통째로 한 트랙으로 반환.
+    # 그보다 길면 트랙 정보가 없는 컴필레이션으로 보고 빈 리스트를 돌려 필터링한다.
+    if duration is not None and duration <= single_track_max_sec:
+        tracks.append(Track(
+            video=video,
+            index=1,
+            title=video.title,
+            start=0.0,
+            end=duration,
+        ))
     return tracks
 
 
@@ -368,57 +392,72 @@ class LPRecord(tk.Canvas):
     def _draw_static(self):
         C = COLORS
         cx = cy = self.size / 2
-        r = self.size / 2 - 6
+        r = self.size / 2 - 4
 
-        # 외곽 서브틀 테두리
-        self.create_oval(cx - r - 2, cy - r - 2,
-                         cx + r + 2, cy + r + 2,
-                         outline=C["border_str"], width=1)
-        # LP 본체
+        # 외곽 글로우 (골드 톤 그라데이션 느낌)
+        for i, shade in enumerate(["#14100a", "#221a10", "#3a2e1c"]):
+            ro = r + 3 - i
+            self.create_oval(cx - ro, cy - ro, cx + ro, cy + ro,
+                             outline=shade, width=1)
+        # LP 본체 + 골드 림 (명확한 대비)
         self.create_oval(cx - r, cy - r, cx + r, cy + r,
-                         fill=C["vinyl"], outline=C["vinyl_edge"], width=1)
-        # 그루브 (동심원) — 짝/홀로 음영차
-        ring_outer = r - 8
-        ring_inner = r * 0.38
-        n = max(14, int((ring_outer - ring_inner) / 1.3))
+                         fill="#050608", outline=C["primary_d"], width=2)
+        # 본체 내측 라인 (깊이감)
+        r2 = r - 3
+        self.create_oval(cx - r2, cy - r2, cx + r2, cy + r2,
+                         outline="#2a2e3a", width=1)
+        # 그루브 — 대비 높여 또렷하게
+        ring_outer = r - 9
+        ring_inner = r * 0.42
+        n = max(14, int((ring_outer - ring_inner) / 1.2))
         for i in range(n):
             t = i / max(n - 1, 1)
             gr = ring_outer - (ring_outer - ring_inner) * t
-            shade = "#171a23" if i % 2 == 0 else "#0f1219"
+            shade = "#252a36" if i % 2 == 0 else "#10131a"
             self.create_oval(cx - gr, cy - gr, cx + gr, cy + gr,
                              outline=shade, width=1)
-        # 라벨 (가운데 원)
-        lr = ring_inner - 4
+        # 라벨 (골드 디스크) — 큼직하게
+        lr = ring_inner - 2
         self.create_oval(cx - lr, cy - lr, cx + lr, cy + lr,
-                         fill=C["vinyl_label"],
-                         outline=C["vinyl_label_rim"], width=1)
-        # 라벨 상단 하이라이트 호 (윤기)
+                         fill=C["primary"], outline=C["primary_d"], width=1)
+        # 라벨 내부 보조 원 (진짜 바이닐 라벨 느낌)
+        lr2 = lr * 0.55
+        self.create_oval(cx - lr2, cy - lr2, cx + lr2, cy + lr2,
+                         outline="#8a6d44", width=1)
+        # 라벨 상단 윤기 호
         self.create_arc(cx - lr + 3, cy - lr + 3,
                         cx + lr - 6, cy + lr - 6,
                         start=50, extent=85, style="arc",
-                        outline=C["vinyl_label_hi"], width=2)
+                        outline="#f4d080", width=2)
 
     def _draw_marker(self):
-        """회전마커 + 중심 홀을 다시 그린다."""
-        if self._marker_item is not None:
-            self.delete(self._marker_item)
-        if self._center_item is not None:
-            self.delete(self._center_item)
+        """회전마커(라벨 위 짙은 점 + 방사선 3줄) + 중심 홀을 다시 그린다."""
+        self.delete("dyn")
         cx = cy = self.size / 2
-        r = self.size / 2 - 6
-        lr = r * 0.38 - 4
+        r = self.size / 2 - 4
+        lr = r * 0.42 - 2
         a = math.radians(self.angle)
-        mx = cx + lr * 0.55 * math.cos(a)
-        my = cy + lr * 0.55 * math.sin(a)
-        self._marker_item = self.create_oval(
-            mx - 4, my - 4, mx + 4, my + 4,
-            fill=COLORS["vinyl_mark"], outline=""
-        )
+
+        # 그루브 위의 방사선 3줄 (120도 간격) — 회전 감이 뚜렷해짐
+        ring_outer = r - 9
+        ring_inner = lr
+        for k in range(3):
+            ang = a + k * (2 * math.pi / 3)
+            x1 = cx + ring_inner * math.cos(ang)
+            y1 = cy + ring_inner * math.sin(ang)
+            x2 = cx + ring_outer * math.cos(ang)
+            y2 = cy + ring_outer * math.sin(ang)
+            self.create_line(x1, y1, x2, y2,
+                             fill="#2d323e", width=1, tags="dyn")
+
+        # 라벨 위 마커 점 (짙은 갈색)
+        mx = cx + lr * 0.6 * math.cos(a)
+        my = cy + lr * 0.6 * math.sin(a)
+        self.create_oval(mx - 4, my - 4, mx + 4, my + 4,
+                         fill="#2a1f14", outline="", tags="dyn")
         # 중심 홀
-        self._center_item = self.create_oval(
-            cx - 3, cy - 3, cx + 3, cy + 3,
-            fill=self.bg, outline="#111217"
-        )
+        self.create_oval(cx - 3, cy - 3, cx + 3, cy + 3,
+                         fill=self.bg, outline="#111217", tags="dyn")
 
     def start(self):
         if not self.spinning:
@@ -463,6 +502,7 @@ class App(tk.Tk):
             value=os.path.join(os.path.expanduser("~"), "Downloads", "YTMusic")
         )
         self.start_offset_var = tk.DoubleVar(value=0.25)
+        self.single_track_max_min_var = tk.IntVar(value=SINGLE_TRACK_MAX_SEC // 60)
         self.msg_queue: "queue.Queue[tuple]" = queue.Queue()
 
         self._apply_styles()
@@ -766,9 +806,22 @@ class App(tk.Tk):
                   background=C["surface"], foreground=C["muted"],
                   font=(ui, 9)).pack(side="left", padx=(6, 0))
 
+        ttk.Label(inner, text="단일곡 최대 길이(분)",
+                  style="FieldLabel.TLabel").grid(row=2, column=2, sticky="w",
+                                                   pady=(14, 0))
+        single_row = ttk.Frame(inner, style="Surface.TFrame")
+        single_row.grid(row=3, column=2, sticky="w", pady=(4, 0))
+        ttk.Spinbox(single_row, from_=1, to=180, width=6,
+                    textvariable=self.single_track_max_min_var,
+                    font=(ui, 11))\
+            .pack(side="left")
+        ttk.Label(single_row, text=" 이하는 단일곡 취급",
+                  background=C["surface"], foreground=C["muted"],
+                  font=(ui, 9)).pack(side="left", padx=(6, 0))
+
         inner.columnconfigure(0, weight=3)
         inner.columnconfigure(1, weight=1)
-        inner.columnconfigure(2, weight=0)
+        inner.columnconfigure(2, weight=1)
 
         # ── 본문: 좌(영상) / 우(트랙) ──
         body = ttk.Panedwindow(self, orient="horizontal")
@@ -1047,9 +1100,11 @@ class App(tk.Tk):
                          f"{len(chosen)}개 영상에서 트랙을 가져오는 중...")
         self.btn_extract.config(state="disabled")
 
+        single_max_sec = max(1, int(self.single_track_max_min_var.get() or 15)) * 60
+
         def work():
             all_tracks: list[Track] = []
-            # 트랙리스트/챕터가 전혀 없어 처리 불가한 영상
+            # 챕터/설명 타임스탬프 없고 단일곡도 아닌(너무 긴) 영상
             no_tracks: list[tuple[str, str]] = []  # (video_id, title)
             for i, v in enumerate(chosen, 1):
                 self.msg_queue.put(("stage",
@@ -1058,7 +1113,8 @@ class App(tk.Tk):
                     f"트랙 추출 중 ({i}/{len(chosen)}): {v.title}"))
                 try:
                     info = YtWrapper.full_info(v)
-                    tks = extract_tracks(v, info)
+                    tks = extract_tracks(v, info,
+                                          single_track_max_sec=single_max_sec)
                     if not tks:
                         no_tracks.append((v.video_id, v.title))
                         continue
@@ -1317,7 +1373,7 @@ class App(tk.Tk):
                     self.btn_search.config(state="normal")
                 elif kind == "tracks_done":
                     tracks, no_tracks = payload
-                    # 트랙리스트 없는 영상을 검색 결과에서 제거
+                    # 트랙리스트도 없고 단일곡 길이도 아닌 영상을 결과에서 제거
                     if no_tracks:
                         bad_ids = {vid for vid, _ in no_tracks}
                         for vid in bad_ids:
@@ -1339,11 +1395,12 @@ class App(tk.Tk):
                                             for _, t in no_tracks[:10])
                         if len(no_tracks) > 10:
                             sample += f"\n... 외 {len(no_tracks) - 10}개"
+                        mm = max(1, int(self.single_track_max_min_var.get() or 15))
                         messagebox.showinfo(
                             "처리 불가 영상 제거",
-                            "챕터 또는 설명 타임스탬프 기반 트랙리스트가 없어\n"
-                            f"처리할 수 없는 영상 {len(no_tracks)}개를 "
-                            f"검색 결과에서 제거했습니다.\n\n{sample}"
+                            f"챕터/설명 타임스탬프가 없고 단일곡({mm}분 이하)도\n"
+                            f"아닌 영상 {len(no_tracks)}개를 검색 결과에서 "
+                            f"제거했습니다.\n\n{sample}"
                         )
                 elif kind == "download_done":
                     self.progress.configure(mode="determinate", value=100)
