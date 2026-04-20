@@ -22,6 +22,9 @@ build/
 dist/
 *.egg-info/
 
+# Bundled third-party binaries staged for PyInstaller (not redistributed in source)
+vendor/
+
 # Output of this app (downloaded media / temp audio)
 *.mp3
 *.m4a

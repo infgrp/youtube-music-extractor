@@ -254,8 +254,30 @@ class YtWrapper:
 
 # ---------- ffmpeg 호출 ----------
 
+def _ffmpeg_path() -> Optional[str]:
+    """번들된 ffmpeg 을 우선 찾고, 없으면 PATH 에서 찾는다.
+
+    PyInstaller onefile 로 빌드된 경우 `sys._MEIPASS` 에,
+    onedir/개발 실행 시에는 실행 파일/스크립트와 같은 폴더에 배치된
+    `ffmpeg.exe` 를 찾는다. 모두 실패하면 시스템 PATH 에서 검색한다.
+    """
+    exe = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    candidates = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, exe))
+    if getattr(sys, "frozen", False):
+        candidates.append(os.path.join(os.path.dirname(sys.executable), exe))
+    else:
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), exe))
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return shutil.which("ffmpeg")
+
+
 def ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
+    return _ffmpeg_path() is not None
 
 
 def _safe_filename(name: str) -> str:
@@ -287,7 +309,7 @@ def split_to_mp3(source_path: str, track: Track, out_dir: str,
     fast_seek = max(0.0, start - PAD)
     fine_seek = start - fast_seek  # 0.0 ~ PAD
 
-    cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+    cmd = [_ffmpeg_path() or "ffmpeg", "-y", "-loglevel", "error"]
     if fast_seek > 0.0:
         cmd += ["-ss", f"{fast_seek:.3f}"]
     cmd += ["-i", source_path]
