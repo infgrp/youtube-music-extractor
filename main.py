@@ -254,6 +254,11 @@ class YtWrapper:
 
 # ---------- ffmpeg 호출 ----------
 
+_SUBPROCESS_FLAGS = (
+    subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+)
+
+
 def _ffmpeg_path() -> Optional[str]:
     """번들된 ffmpeg 을 우선 찾고, 없으면 PATH 에서 찾는다.
 
@@ -330,7 +335,21 @@ def split_to_mp3(source_path: str, track: Track, out_dir: str,
         "-metadata", f"track={track.index}",
         out_path,
     ]
-    subprocess.run(cmd, check=True)
+    # --noconsole 로 빌드된 PyInstaller exe 는 stdin/stdout/stderr 가 None 이라
+    # 자식 프로세스가 상속받으면 즉시 실패할 수 있다. 명시적으로 redirect 하고
+    # Windows 에서는 콘솔 창이 깜빡이지 않도록 CREATE_NO_WINDOW 를 준다.
+    # 실패 시 ffmpeg stderr 를 CalledProcessError.stderr 에 담아 상위에서
+    # 사용자에게 표시할 수 있게 한다.
+    res = subprocess.run(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        creationflags=_SUBPROCESS_FLAGS,
+    )
+    if res.returncode != 0:
+        err = (res.stderr or b"").decode("utf-8", "replace").strip()
+        raise subprocess.CalledProcessError(res.returncode, cmd, stderr=err)
     return out_path
 
 
@@ -1348,8 +1367,13 @@ class App(tk.Tk):
                             split_to_mp3(src, t, out_dir, start_offset=offset)
                             self.msg_queue.put(("track_status", (idx, "done")))
                         except subprocess.CalledProcessError as e:
+                            tail = ""
+                            if e.stderr:
+                                s = e.stderr if isinstance(e.stderr, str) else \
+                                    e.stderr.decode("utf-8", "replace")
+                                tail = " — " + s.strip().splitlines()[-1][:200]
                             self.msg_queue.put(("warn",
-                                f"MP3 실패 '{t.title}': ffmpeg 종료코드 {e.returncode}"))
+                                f"MP3 실패 '{t.title}': ffmpeg 종료코드 {e.returncode}{tail}"))
                             self.msg_queue.put(("track_status", (idx, "failed")))
                         except Exception as e:
                             self.msg_queue.put(("warn", f"MP3 실패 '{t.title}': {e}"))
