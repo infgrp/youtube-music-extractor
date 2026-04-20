@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import math
 import shutil
 import subprocess
 import threading
@@ -246,17 +247,31 @@ def split_to_mp3(source_path: str, track: Track, out_dir: str,
     suffix = f" [{track.video.video_id}]" if track.video.video_id else ""
     out_path = os.path.join(out_dir, f"{base}{suffix}.mp3")
 
-    # 앞 곡 꼬리가 섞이는 것을 방지하기 위해 경계 시각을 offset 만큼 뒤로 민다.
-    # 단, start=0 인 첫 트랙은 그대로(실제 0 부터 음악이 시작).
+    # 시작점만 offset 만큼 뒤로 민다 — 앞 곡 꼬리를 스킵하기 위해.
+    # 첫 트랙(start=0)은 그대로. 끝은 유튜브가 표시한 경계 그대로 두어
+    # 다음 곡 인트로가 섞이지 않게 한다 (이전에 end 에도 offset 을 더해
+    # 다음 곡 첫 부분이 현재 트랙 뒤에 붙는 버그가 있었음).
     start = track.start + (start_offset if track.start > 0.0 else 0.0)
-    end = (track.end + start_offset) if track.end is not None else None
+    end = track.end
 
-    cmd = ["ffmpeg", "-y", "-loglevel", "error",
-           "-ss", f"{start:.3f}"]
+    # 샘플 정확한 컷을 위해 하이브리드 seek 사용:
+    #   1) INPUT 쪽 -ss 로 target 약 2초 전까지 빠르게 이동
+    #   2) OUTPUT 쪽 -ss 로 남은 거리를 디코더가 샘플 단위로 버림
+    # 이렇게 하면 opus/webm 같이 컨테이너 seek 가 거친 포맷에서도
+    # 최종 출력이 정확히 start 에서 시작한다.
+    PAD = 2.0
+    fast_seek = max(0.0, start - PAD)
+    fine_seek = start - fast_seek  # 0.0 ~ PAD
+
+    cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+    if fast_seek > 0.0:
+        cmd += ["-ss", f"{fast_seek:.3f}"]
+    cmd += ["-i", source_path]
+    if fine_seek > 0.0:
+        cmd += ["-ss", f"{fine_seek:.3f}"]
     if end is not None and end > start:
         cmd += ["-t", f"{(end - start):.3f}"]
     cmd += [
-        "-i", source_path,
         "-vn",
         "-acodec", "libmp3lame",
         "-b:a", "320k",
@@ -278,34 +293,147 @@ def split_to_mp3(source_path: str, track: Track, out_dir: str,
 # ---------- 테마 색상 ----------
 
 COLORS = {
-    "bg":          "#eef1f6",   # 페이지 배경 (subtle cool gray)
-    "surface":     "#ffffff",   # 카드 배경
-    "surface_alt": "#f8fafc",   # 카드 안쪽 배경/헤더 영역
-    "text":        "#0f172a",   # slate-900
-    "text_sub":    "#334155",   # 보조 텍스트
-    "muted":       "#64748b",   # muted 텍스트
-    "border":      "#e2e8f0",   # slate-200
-    "border_str":  "#cbd5e1",   # slate-300
-    "primary":     "#4f46e5",   # indigo-600
-    "primary_h":   "#4338ca",   # indigo-700
-    "primary_l":   "#eef2ff",   # indigo-50 tint
-    "accent":      "#10b981",   # emerald-500
-    "accent_h":    "#059669",
-    "success":     "#059669",
-    "success_bg":  "#d1fae5",
-    "warn":        "#b45309",
-    "warn_bg":     "#fef3c7",
-    "danger":      "#dc2626",
-    "danger_bg":   "#fee2e2",
-    "info":        "#2563eb",
-    "info_bg":     "#dbeafe",
-    "zebra":       "#f8fafc",
-    "selection":   "#e0e7ff",   # indigo-100
-    "status_bg":   "#0f172a",   # slate-900
-    "status_bg2":  "#1e293b",
-    "status_fg":   "#e2e8f0",
-    "status_acc":  "#a5b4fc",   # indigo-300
+    # --- Backgrounds (딥 차콜) ---
+    "bg":          "#0d0e14",
+    "surface":     "#151821",
+    "surface_alt": "#1b1f2a",
+    "surface_hi":  "#22263a",
+
+    # --- Text ---
+    "text":        "#f2f4f8",
+    "text_sub":    "#c4c9d4",
+    "muted":       "#7c8292",
+    "dim":         "#565c6a",
+
+    # --- Borders ---
+    "border":      "#1e222d",
+    "border_str":  "#2a2f3d",
+
+    # --- Primary: 바이닐 라벨 골드 ---
+    "primary":     "#d4a853",
+    "primary_h":   "#e6bd63",
+    "primary_d":   "#a88440",
+    "primary_l":   "#2a2218",
+
+    # --- Accent: 딥 틸 (포인트 색) ---
+    "accent":      "#3d9aa1",
+    "accent_h":    "#4fb0b6",
+
+    # --- Status ---
+    "success":     "#6ec175",
+    "success_bg":  "#152a18",
+    "warn":        "#e0b055",
+    "warn_bg":     "#2a2218",
+    "danger":      "#d47272",
+    "danger_bg":   "#2a1717",
+    "info":        "#7a9ed4",
+    "info_bg":     "#152036",
+
+    # --- Lists ---
+    "zebra":       "#12141b",
+    "row_even":    "#15181f",
+    "selection":   "#2a2218",
+
+    # --- Player(하단 상태) 바 ---
+    "status_bg":   "#07080b",
+    "status_bg2":  "#101218",
+    "status_fg":   "#edeff4",
+    "status_acc":  "#d4a853",
+
+    # --- Vinyl ---
+    "vinyl":       "#0a0b0e",
+    "vinyl_edge":  "#1a1c22",
+    "vinyl_label": "#b8905a",
+    "vinyl_label_rim": "#8a6d44",
+    "vinyl_label_hi":  "#e6bd63",
+    "vinyl_mark":  "#2a1f14",
 }
+
+
+class LPRecord(tk.Canvas):
+    """회전하는 LP 바이닐 — 진행 중 인디케이터."""
+
+    def __init__(self, parent, size: int = 150, bg: str = "#07080b"):
+        super().__init__(parent, width=size, height=size,
+                         bg=bg, highlightthickness=0, bd=0)
+        self.size = size
+        self.bg = bg
+        self.angle = 0.0
+        self.spinning = False
+        self._marker_item = None
+        self._center_item = None
+        self._draw_static()
+        self._draw_marker()
+
+    def _draw_static(self):
+        C = COLORS
+        cx = cy = self.size / 2
+        r = self.size / 2 - 6
+
+        # 외곽 서브틀 테두리
+        self.create_oval(cx - r - 2, cy - r - 2,
+                         cx + r + 2, cy + r + 2,
+                         outline=C["border_str"], width=1)
+        # LP 본체
+        self.create_oval(cx - r, cy - r, cx + r, cy + r,
+                         fill=C["vinyl"], outline=C["vinyl_edge"], width=1)
+        # 그루브 (동심원) — 짝/홀로 음영차
+        ring_outer = r - 8
+        ring_inner = r * 0.38
+        n = max(14, int((ring_outer - ring_inner) / 1.3))
+        for i in range(n):
+            t = i / max(n - 1, 1)
+            gr = ring_outer - (ring_outer - ring_inner) * t
+            shade = "#171a23" if i % 2 == 0 else "#0f1219"
+            self.create_oval(cx - gr, cy - gr, cx + gr, cy + gr,
+                             outline=shade, width=1)
+        # 라벨 (가운데 원)
+        lr = ring_inner - 4
+        self.create_oval(cx - lr, cy - lr, cx + lr, cy + lr,
+                         fill=C["vinyl_label"],
+                         outline=C["vinyl_label_rim"], width=1)
+        # 라벨 상단 하이라이트 호 (윤기)
+        self.create_arc(cx - lr + 3, cy - lr + 3,
+                        cx + lr - 6, cy + lr - 6,
+                        start=50, extent=85, style="arc",
+                        outline=C["vinyl_label_hi"], width=2)
+
+    def _draw_marker(self):
+        """회전마커 + 중심 홀을 다시 그린다."""
+        if self._marker_item is not None:
+            self.delete(self._marker_item)
+        if self._center_item is not None:
+            self.delete(self._center_item)
+        cx = cy = self.size / 2
+        r = self.size / 2 - 6
+        lr = r * 0.38 - 4
+        a = math.radians(self.angle)
+        mx = cx + lr * 0.55 * math.cos(a)
+        my = cy + lr * 0.55 * math.sin(a)
+        self._marker_item = self.create_oval(
+            mx - 4, my - 4, mx + 4, my + 4,
+            fill=COLORS["vinyl_mark"], outline=""
+        )
+        # 중심 홀
+        self._center_item = self.create_oval(
+            cx - 3, cy - 3, cx + 3, cy + 3,
+            fill=self.bg, outline="#111217"
+        )
+
+    def start(self):
+        if not self.spinning:
+            self.spinning = True
+            self._tick()
+
+    def stop(self):
+        self.spinning = False
+
+    def _tick(self):
+        if not self.spinning:
+            return
+        self.angle = (self.angle + 5) % 360
+        self._draw_marker()
+        self.after(40, self._tick)
 
 
 class App(tk.Tk):
@@ -380,17 +508,18 @@ class App(tk.Tk):
         C = COLORS
         ui = self.F_UI
 
-        f_body  = (ui, 10)
-        f_bold  = (ui, 10, "bold")
-        f_small = (ui, 9)
-        f_hdr   = (ui, 11, "bold")
-        f_title = (ui, 18, "bold")
+        f_body   = (ui, 10)
+        f_bold   = (ui, 10, "bold")
+        f_small  = (ui, 9)
+        f_hdr    = (ui, 11, "bold")
+        f_title  = (ui, 22, "bold")
         f_subtitle = (ui, 10)
-        f_badge = (ui, 9, "bold")
+        f_badge  = (ui, 9, "bold")
 
         # 기본
         style.configure(".", background=C["bg"], foreground=C["text"],
-                        font=f_body, borderwidth=0, focuscolor=C["primary"])
+                        font=f_body, borderwidth=0,
+                        focuscolor=C["primary"])
         style.configure("TFrame", background=C["bg"])
         style.configure("Surface.TFrame", background=C["surface"])
         style.configure("SurfaceAlt.TFrame", background=C["surface_alt"])
@@ -398,36 +527,24 @@ class App(tk.Tk):
 
         # 레이블
         style.configure("TLabel", background=C["bg"], foreground=C["text"])
-        style.configure("Surface.TLabel", background=C["surface"], foreground=C["text"])
-        style.configure("SurfaceAlt.TLabel", background=C["surface_alt"], foreground=C["text"])
-        style.configure("Title.TLabel", background=C["bg"], foreground=C["text"],
-                        font=f_title)
-        style.configure("Subtitle.TLabel", background=C["bg"], foreground=C["muted"],
-                        font=f_subtitle)
+        style.configure("Surface.TLabel",
+                        background=C["surface"], foreground=C["text"])
+        style.configure("SurfaceAlt.TLabel",
+                        background=C["surface_alt"], foreground=C["text"])
+        style.configure("Title.TLabel", background=C["bg"],
+                        foreground=C["text"], font=f_title)
+        style.configure("Subtitle.TLabel", background=C["bg"],
+                        foreground=C["muted"], font=f_subtitle)
         style.configure("SectionHdr.TLabel", background=C["surface"],
                         foreground=C["muted"], font=f_badge)
-        style.configure("Muted.TLabel", background=C["bg"], foreground=C["muted"],
-                        font=f_small)
+        style.configure("Muted.TLabel", background=C["bg"],
+                        foreground=C["muted"], font=f_small)
         style.configure("FieldLabel.TLabel", background=C["surface"],
                         foreground=C["text_sub"], font=f_bold)
 
-        # 카드(라벨프레임)
-        style.configure("Card.TLabelframe",
-                        background=C["surface"],
-                        bordercolor=C["border"],
-                        lightcolor=C["border"],
-                        darkcolor=C["border"],
-                        relief="solid",
-                        borderwidth=1)
-        style.configure("Card.TLabelframe.Label",
-                        background=C["surface"],
-                        foreground=C["text"],
-                        font=f_hdr,
-                        padding=(10, 4))
-
-        # 버튼 — 기본(보조)
+        # 버튼 — 보조 (고스트, 다크)
         style.configure("TButton",
-                        background=C["surface"],
+                        background=C["surface_alt"],
                         foreground=C["text_sub"],
                         bordercolor=C["border_str"],
                         padding=(14, 9),
@@ -436,15 +553,18 @@ class App(tk.Tk):
                         focusthickness=0,
                         font=f_bold)
         style.map("TButton",
-                  background=[("active", "#f1f5f9"), ("pressed", "#e2e8f0"),
-                              ("disabled", "#f1f5f9")],
-                  foreground=[("disabled", C["muted"])],
-                  bordercolor=[("active", C["primary"]), ("focus", C["primary"])])
+                  background=[("active", C["surface_hi"]),
+                              ("pressed", C["border_str"]),
+                              ("disabled", C["surface_alt"])],
+                  foreground=[("active", C["text"]),
+                              ("disabled", C["dim"])],
+                  bordercolor=[("active", C["primary"]),
+                               ("focus", C["primary"])])
 
-        # 버튼 — Primary (indigo)
+        # 버튼 — Primary (바이닐 골드)
         style.configure("Primary.TButton",
                         background=C["primary"],
-                        foreground="white",
+                        foreground="#1a1408",
                         bordercolor=C["primary"],
                         padding=(18, 10),
                         borderwidth=0,
@@ -453,14 +573,15 @@ class App(tk.Tk):
                         font=f_bold)
         style.map("Primary.TButton",
                   background=[("active", C["primary_h"]),
-                              ("pressed", C["primary_h"]),
-                              ("disabled", "#a5b4fc")],
-                  foreground=[("active", "white"), ("disabled", "#eef2ff")])
+                              ("pressed", C["primary_d"]),
+                              ("disabled", "#4a3d20")],
+                  foreground=[("active", "#1a1408"),
+                              ("disabled", "#8a7850")])
 
-        # 버튼 — Accent (emerald)
+        # 버튼 — Accent (딥 틸)
         style.configure("Accent.TButton",
                         background=C["accent"],
-                        foreground="white",
+                        foreground="#07161a",
                         bordercolor=C["accent"],
                         padding=(18, 10),
                         borderwidth=0,
@@ -469,11 +590,12 @@ class App(tk.Tk):
                         font=f_bold)
         style.map("Accent.TButton",
                   background=[("active", C["accent_h"]),
-                              ("pressed", C["accent_h"]),
-                              ("disabled", "#6ee7b7")],
-                  foreground=[("active", "white"), ("disabled", "#ecfdf5")])
+                              ("pressed", "#2f7e84"),
+                              ("disabled", "#1e4a4d")],
+                  foreground=[("active", "#07161a"),
+                              ("disabled", "#5e8288")])
 
-        # 버튼 — Danger (외곽선 스타일)
+        # 버튼 — Ghost (Danger 외곽)
         style.configure("Ghost.TButton",
                         background=C["surface"],
                         foreground=C["danger"],
@@ -486,37 +608,38 @@ class App(tk.Tk):
                   background=[("active", C["danger_bg"]),
                               ("pressed", C["danger_bg"])])
 
-        # Entry / Spinbox
+        # Entry / Spinbox (다크 필드)
         style.configure("TEntry",
-                        fieldbackground="white",
+                        fieldbackground=C["surface_alt"],
                         foreground=C["text"],
                         bordercolor=C["border_str"],
                         lightcolor=C["border_str"],
                         darkcolor=C["border_str"],
                         insertcolor=C["primary"],
-                        padding=8)
+                        padding=9)
         style.map("TEntry",
                   bordercolor=[("focus", C["primary"])],
                   lightcolor=[("focus", C["primary"])],
                   darkcolor=[("focus", C["primary"])])
 
         style.configure("TSpinbox",
-                        fieldbackground="white",
+                        fieldbackground=C["surface_alt"],
                         foreground=C["text"],
                         bordercolor=C["border_str"],
                         lightcolor=C["border_str"],
                         darkcolor=C["border_str"],
-                        arrowcolor=C["text_sub"],
-                        padding=6,
+                        arrowcolor=C["primary"],
+                        padding=7,
                         arrowsize=14)
-        style.map("TSpinbox", bordercolor=[("focus", C["primary"])])
+        style.map("TSpinbox",
+                  bordercolor=[("focus", C["primary"])])
 
-        # Treeview
+        # Treeview (다크 리스트)
         style.configure("Treeview",
-                        background="white",
-                        fieldbackground="white",
+                        background=C["surface"],
+                        fieldbackground=C["surface"],
                         foreground=C["text"],
-                        rowheight=32,
+                        rowheight=34,
                         bordercolor=C["border"],
                         borderwidth=0,
                         relief="flat",
@@ -529,25 +652,26 @@ class App(tk.Tk):
                         padding=(10, 10),
                         relief="flat")
         style.map("Treeview.Heading",
-                  background=[("active", C["primary_l"])])
+                  background=[("active", C["surface_hi"])],
+                  foreground=[("active", C["primary"])])
         style.map("Treeview",
                   background=[("selected", C["selection"])],
-                  foreground=[("selected", C["text"])])
+                  foreground=[("selected", C["primary_h"])])
 
-        # Progressbar
+        # Progressbar (얇은 바, 골드)
         style.configure("Horizontal.TProgressbar",
-                        background=C["status_acc"],
+                        background=C["primary"],
                         troughcolor=C["status_bg2"],
                         bordercolor=C["status_bg2"],
-                        lightcolor=C["status_acc"],
-                        darkcolor=C["status_acc"],
-                        thickness=10)
+                        lightcolor=C["primary"],
+                        darkcolor=C["primary"],
+                        thickness=6)
 
-        # Scrollbar
+        # Scrollbar (슬림)
         style.configure("Vertical.TScrollbar",
                         background=C["surface_alt"],
                         troughcolor=C["surface"],
-                        bordercolor=C["border"],
+                        bordercolor=C["surface"],
                         arrowcolor=C["muted"],
                         lightcolor=C["surface_alt"],
                         darkcolor=C["surface_alt"],
@@ -557,7 +681,6 @@ class App(tk.Tk):
         style.map("Vertical.TScrollbar",
                   background=[("active", C["border_str"])])
 
-        # Separator / Panedwindow
         style.configure("TSeparator", background=C["border"])
         style.configure("TPanedwindow", background=C["bg"])
 
@@ -567,32 +690,35 @@ class App(tk.Tk):
         C = COLORS
         ui = self.F_UI
 
-        # ── 헤더 ──
-        header = ttk.Frame(self, padding=(28, 20, 28, 6))
+        # ── 헤더 (미니 LP 로고) ──
+        header = ttk.Frame(self, padding=(28, 18, 28, 4))
         header.pack(fill="x")
         brand = ttk.Frame(header)
         brand.pack(side="left")
 
-        # 좌측 로고 블록 (indigo 뱃지)
-        badge = tk.Label(brand, text="♪", bg=C["primary"], fg="white",
-                         font=(ui, 18, "bold"), padx=14, pady=6)
-        badge.pack(side="left", padx=(0, 12))
+        # 작은 정적 LP — 브랜드 마크
+        logo = LPRecord(brand, size=54, bg=C["bg"])
+        logo.pack(side="left", padx=(0, 14))
 
         ttext = ttk.Frame(brand)
-        ttext.pack(side="left")
+        ttext.pack(side="left", anchor="w")
         ttk.Label(ttext, text="YouTube Music Extractor",
                   style="Title.TLabel").pack(anchor="w")
         ttk.Label(ttext,
-                  text="키워드로 검색한 영상의 트랙을 분리해 최고 음질 MP3로 저장합니다.",
-                  style="Subtitle.TLabel").pack(anchor="w")
+                  text="키워드로 영상을 찾아 챕터별 트랙을 최고 음질 MP3 로 추출합니다.",
+                  style="Subtitle.TLabel").pack(anchor="w", pady=(2, 0))
 
-        # ── 검색 카드 ──
+        # 헤더 하단 구분선 (골드 + 페이드)
+        sep = tk.Frame(self, bg=C["primary"], height=1)
+        sep.pack(fill="x", padx=28, pady=(6, 0))
+
+        # ── 검색 카드 (다크) ──
         search_card = tk.Frame(self, bg=C["surface"],
                                highlightbackground=C["border"],
                                highlightthickness=1)
         search_card.pack(fill="x", padx=28, pady=(14, 8))
 
-        inner = ttk.Frame(search_card, style="Surface.TFrame", padding=(18, 16))
+        inner = ttk.Frame(search_card, style="Surface.TFrame", padding=(20, 18))
         inner.pack(fill="x")
 
         ttk.Label(inner, text="검색어",
@@ -677,9 +803,9 @@ class App(tk.Tk):
         cols_v = ("sel", "dur", "title", "uploader")
         self.tv_videos = ttk.Treeview(tv_wrap_v, columns=cols_v, show="headings",
                                        selectmode="extended")
-        for c, t in zip(cols_v, ("✓", "길이", "제목", "채널")):
+        for c, t in zip(cols_v, ("◉", "길이", "제목", "채널")):
             self.tv_videos.heading(c, text=t)
-        self.tv_videos.column("sel", width=46, anchor="center", stretch=False)
+        self.tv_videos.column("sel", width=48, anchor="center", stretch=False)
         self.tv_videos.column("dur", width=82, anchor="center", stretch=False)
         self.tv_videos.column("title", width=380)
         self.tv_videos.column("uploader", width=160)
@@ -688,9 +814,11 @@ class App(tk.Tk):
         self.tv_videos.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
         self.tv_videos.pack(side="left", fill="both", expand=True)
-        self.tv_videos.tag_configure("odd", background=C["zebra"])
-        self.tv_videos.tag_configure("even", background="white")
-        self.tv_videos.tag_configure("picked", background=C["primary_l"],
+        self.tv_videos.tag_configure("odd", background=C["zebra"],
+                                     foreground=C["text"])
+        self.tv_videos.tag_configure("even", background=C["surface"],
+                                     foreground=C["text"])
+        self.tv_videos.tag_configure("picked", background=C["selection"],
                                      foreground=C["primary_h"])
         self.tv_videos.bind("<Button-1>", self._on_video_single_click)
         self.tv_videos.bind("<Double-1>", self._on_video_double_click)
@@ -702,7 +830,7 @@ class App(tk.Tk):
         body.add(right, weight=1)
         self._build_list_header(right,
             title="트랙",
-            hint="상태: ⏳ 대기 · ▶ 진행중 · ✓ 완료 · ✕ 실패")
+            hint="상태:  ○ 대기 · ◉ 재생중 · ✓ 완료 · ✕ 실패")
 
         right_btns = ttk.Frame(right, style="Surface.TFrame")
         right_btns.pack(side="bottom", fill="x", padx=14, pady=(6, 14))
@@ -725,10 +853,10 @@ class App(tk.Tk):
         cols_t = ("sel", "status", "range", "title", "source")
         self.tv_tracks = ttk.Treeview(tv_wrap_t, columns=cols_t, show="headings",
                                        selectmode="extended")
-        for c, t in zip(cols_t, ("✓", "상태", "구간", "트랙 제목", "원본 영상")):
+        for c, t in zip(cols_t, ("◉", "상태", "구간", "트랙 제목", "원본 영상")):
             self.tv_tracks.heading(c, text=t)
-        self.tv_tracks.column("sel", width=46, anchor="center", stretch=False)
-        self.tv_tracks.column("status", width=100, anchor="center", stretch=False)
+        self.tv_tracks.column("sel", width=48, anchor="center", stretch=False)
+        self.tv_tracks.column("status", width=110, anchor="center", stretch=False)
         self.tv_tracks.column("range", width=130, anchor="center", stretch=False)
         self.tv_tracks.column("title", width=260)
         self.tv_tracks.column("source", width=200)
@@ -737,11 +865,13 @@ class App(tk.Tk):
         self.tv_tracks.configure(yscrollcommand=vsb2.set)
         vsb2.pack(side="right", fill="y")
         self.tv_tracks.pack(side="left", fill="both", expand=True)
-        self.tv_tracks.tag_configure("odd",  background=C["zebra"])
-        self.tv_tracks.tag_configure("even", background="white")
-        self.tv_tracks.tag_configure("pending", background="white",
+        self.tv_tracks.tag_configure("odd",  background=C["zebra"],
+                                     foreground=C["text"])
+        self.tv_tracks.tag_configure("even", background=C["surface"],
+                                     foreground=C["text"])
+        self.tv_tracks.tag_configure("pending", background=C["surface_alt"],
                                      foreground=C["muted"])
-        self.tv_tracks.tag_configure("running", background=C["info_bg"],
+        self.tv_tracks.tag_configure("running", background=C["primary_l"],
                                      foreground=C["primary_h"])
         self.tv_tracks.tag_configure("done", background=C["success_bg"],
                                      foreground=C["success"])
@@ -751,35 +881,48 @@ class App(tk.Tk):
         self.tv_tracks.bind("<Double-1>", self._on_track_double_click)
         self.tv_tracks.bind("<Delete>", lambda _e: self.on_remove_tracks())
 
-        # ── 다크 푸터 상태 바 ──
-        bottom = tk.Frame(self, bg=C["status_bg"])
-        bottom.pack(fill="x", side="bottom")
+        # ── 플레이어 바 (LP + stage/status/progress) ──
+        player = tk.Frame(self, bg=C["status_bg"])
+        player.pack(fill="x", side="bottom")
 
-        # 상단 라인: stage • detail
-        line1 = tk.Frame(bottom, bg=C["status_bg"])
-        line1.pack(fill="x", padx=28, pady=(14, 6))
+        # 상단 가느다란 골드 라인
+        tk.Frame(player, bg=C["primary"], height=1).pack(fill="x")
 
-        self.stage_var = tk.StringVar(value="●  준비")
+        # LP 원판 (좌) + 정보 스택 (우)
+        player_inner = tk.Frame(player, bg=C["status_bg"])
+        player_inner.pack(fill="x", padx=28, pady=18)
+
+        self.lp = LPRecord(player_inner, size=120, bg=C["status_bg"])
+        self.lp.pack(side="left", padx=(0, 22))
+
+        info = tk.Frame(player_inner, bg=C["status_bg"])
+        info.pack(side="left", fill="both", expand=True)
+
+        # 상단 라인: stage (좌) · 진행 수치 (우)
+        line1 = tk.Frame(info, bg=C["status_bg"])
+        line1.pack(fill="x")
+
+        self.stage_var = tk.StringVar(value="◯  대기 중")
         tk.Label(line1, textvariable=self.stage_var,
                  bg=C["status_bg"], fg=C["status_acc"],
-                 font=(ui, 10, "bold")).pack(side="left")
+                 font=(ui, 12, "bold")).pack(side="left")
 
         self.progress_label_var = tk.StringVar(value="")
         tk.Label(line1, textvariable=self.progress_label_var,
                  bg=C["status_bg"], fg=C["status_fg"],
                  font=(self.F_MONO, 9)).pack(side="right")
 
-        # 진행 바
-        self.progress = ttk.Progressbar(bottom, mode="determinate",
+        # 진행 바 — 얇은 골드 바
+        self.progress = ttk.Progressbar(info, mode="determinate",
                                         maximum=100, value=0)
-        self.progress.pack(fill="x", padx=28, pady=(0, 6))
+        self.progress.pack(fill="x", pady=(10, 10))
 
-        # 하단 라인: 상태 메시지
-        self.status_var = tk.StringVar(value="키워드를 입력하고 검색을 시작하세요.")
-        tk.Label(bottom, textvariable=self.status_var,
-                 bg=C["status_bg"], fg=C["status_fg"],
-                 anchor="w", padx=28, font=(ui, 9))\
-            .pack(fill="x", pady=(0, 14))
+        # 하단 상태 텍스트
+        self.status_var = tk.StringVar(
+            value="키워드를 입력하고 검색을 시작하세요.")
+        tk.Label(info, textvariable=self.status_var,
+                 bg=C["status_bg"], fg=C["muted"],
+                 anchor="w", font=(ui, 9)).pack(fill="x")
 
     def _build_list_header(self, parent, title: str, hint: str):
         """카드 상단에 섹션 제목 + 보조 설명."""
@@ -808,7 +951,7 @@ class App(tk.Tk):
             messagebox.showwarning("알림", "키워드를 입력하세요.")
             return
         n = int(self.count_var.get())
-        self._start_busy("● 검색 중", f"'{kw}' 검색 중...")
+        self._start_busy("◉  검색 중", f"'{kw}' 검색 중...")
         self.btn_search.config(state="disabled")
 
         def work():
@@ -829,7 +972,7 @@ class App(tk.Tk):
             hh, mm = divmod(mm, 60)
             dur = f"{hh:d}:{mm:02d}:{ss:02d}" if hh else f"{mm:02d}:{ss:02d}"
             self.tv_videos.insert("", "end", iid=v.video_id,
-                                  values=("☐", dur, v.title, v.uploader),
+                                  values=("○", dur, v.title, v.uploader),
                                   tags=("odd" if i % 2 else "even",))
 
     def _on_video_single_click(self, event):
@@ -856,7 +999,7 @@ class App(tk.Tk):
     def _refresh_video_row(self, v: VideoItem, idx: int):
         picked = self.video_selected.get(v.video_id, False)
         vals = list(self.tv_videos.item(v.video_id, "values"))
-        vals[0] = "☑" if picked else "☐"
+        vals[0] = "●" if picked else "○"
         self.tv_videos.item(v.video_id, values=vals,
                             tags=(self._video_row_tag(v, idx),))
 
@@ -900,7 +1043,7 @@ class App(tk.Tk):
         if not chosen:
             messagebox.showwarning("알림", "영상을 하나 이상 선택하세요.")
             return
-        self._start_busy("● 트랙 추출 중",
+        self._start_busy("◉  트랙 추출 중",
                          f"{len(chosen)}개 영상에서 트랙을 가져오는 중...")
         self.btn_extract.config(state="disabled")
 
@@ -910,7 +1053,7 @@ class App(tk.Tk):
             no_tracks: list[tuple[str, str]] = []  # (video_id, title)
             for i, v in enumerate(chosen, 1):
                 self.msg_queue.put(("stage",
-                    f"● 트랙 정보 수집  ·  {i} / {len(chosen)}"))
+                    f"◉  트랙 정보 수집  ·  {i} / {len(chosen)}"))
                 self.msg_queue.put(("status",
                     f"트랙 추출 중 ({i}/{len(chosen)}): {v.title}"))
                 try:
@@ -941,7 +1084,7 @@ class App(tk.Tk):
                 return f"{hh:02d}:{mm:02d}:{ss:02d}" if hh else f"{mm:02d}:{ss:02d}"
             rng = f"{fmt(t.start)}~{fmt(t.end)}"
             self.tv_tracks.insert("", "end", iid=str(i),
-                                  values=("☐", "", rng, t.title, t.video.title),
+                                  values=("○", "", rng, t.title, t.video.title),
                                   tags=("odd" if i % 2 else "even",))
 
     def _on_track_click(self, event):
@@ -965,10 +1108,10 @@ class App(tk.Tk):
 
     _STATUS_LABEL = {
         "": "",
-        "pending": "⏳ 대기",
-        "running": "▶ 진행중",
-        "done":    "✓ 완료",
-        "failed":  "✕ 실패",
+        "pending": "○  대기",
+        "running": "◉  재생중",
+        "done":    "✓  완료",
+        "failed":  "✕  실패",
     }
 
     def _row_tag(self, idx: int) -> str:
@@ -981,7 +1124,7 @@ class App(tk.Tk):
         picked = self.track_selected.get(idx, False)
         st = self.track_status.get(idx, "") if hasattr(self, "track_status") else ""
         vals = list(self.tv_tracks.item(str(idx), "values"))
-        vals[0] = "☑" if picked else "☐"
+        vals[0] = "●" if picked else "○"
         vals[1] = self._STATUS_LABEL.get(st, "")
         self.tv_tracks.item(str(idx), values=vals, tags=(self._row_tag(idx),))
 
@@ -1072,11 +1215,12 @@ class App(tk.Tk):
         total = len(chosen_pairs)
         offset = max(0.0, float(self.start_offset_var.get() or 0.0))
 
-        self.msg_queue.put(("stage", f"● 다운로드 & MP3 추출  (0 / {total})"))
+        self.msg_queue.put(("stage", f"◉  다운로드 & MP3 추출  (0 / {total})"))
         self.msg_queue.put(("progress_set", (0.0, "")))
         self.btn_download.config(state="disabled")
         self.btn_search.config(state="disabled")
         self.btn_extract.config(state="disabled")
+        self.lp.start()
 
         def work():
             done = 0
@@ -1102,7 +1246,7 @@ class App(tk.Tk):
                     video = pairs[0][1].video
                     self.msg_queue.put(("status", f"원본 오디오 다운로드: {video.title}"))
                     self.msg_queue.put(("stage",
-                        f"● 원본 다운로드 중  ·  {video.title[:60]}"))
+                        f"◉  원본 다운로드 중  ·  {video.title[:60]}"))
                     try:
                         src = YtWrapper.download_audio(
                             video, tmp_dir, progress_hook=make_hook()
@@ -1119,7 +1263,7 @@ class App(tk.Tk):
                         self.msg_queue.put(("status",
                             f"MP3 추출 ({done}/{total}): {t.title}"))
                         self.msg_queue.put(("stage",
-                            f"● MP3 추출 중  ·  {done} / {total}"))
+                            f"◉  MP3 추출 중  ·  {done} / {total}"))
                         self.msg_queue.put(("overall_progress",
                             ((done - 1) / total * 100.0)))
                         try:
@@ -1148,6 +1292,9 @@ class App(tk.Tk):
             self.status_var.set(status_text)
         self.progress.configure(mode="indeterminate")
         self.progress.start(12)
+        # LP 가 돌기 시작
+        if hasattr(self, "lp"):
+            self.lp.start()
 
     def _stop_busy(self, stage_text: str, status_text: str = ""):
         self.progress.stop()
@@ -1156,6 +1303,9 @@ class App(tk.Tk):
         self.stage_var.set(stage_text)
         if status_text:
             self.status_var.set(status_text)
+        # LP 정지
+        if hasattr(self, "lp"):
+            self.lp.stop()
 
     def _pump_queue(self):
         try:
@@ -1163,7 +1313,7 @@ class App(tk.Tk):
                 kind, payload = self.msg_queue.get_nowait()
                 if kind == "search_done":
                     self._populate_videos(payload)
-                    self._stop_busy("● 준비", f"검색 완료: {len(payload)}건")
+                    self._stop_busy("◯  대기 중", f"검색 완료: {len(payload)}건")
                     self.btn_search.config(state="normal")
                 elif kind == "tracks_done":
                     tracks, no_tracks = payload
@@ -1182,7 +1332,7 @@ class App(tk.Tk):
                     msg = f"트랙 추출 완료: {len(tracks)}건"
                     if no_tracks:
                         msg += f"  ·  처리 불가 영상 {len(no_tracks)}개 제거"
-                    self._stop_busy("● 준비", msg)
+                    self._stop_busy("◯  대기 중", msg)
                     self.btn_extract.config(state="normal")
                     if no_tracks:
                         sample = "\n".join(f"• {t[:60]}"
@@ -1198,11 +1348,12 @@ class App(tk.Tk):
                 elif kind == "download_done":
                     self.progress.configure(mode="determinate", value=100)
                     self.progress_label_var.set("")
-                    self.stage_var.set("● 완료")
+                    self.stage_var.set("✓  완료")
                     self.status_var.set(f"완료. 저장 폴더: {payload}")
                     self.btn_download.config(state="normal")
                     self.btn_search.config(state="normal")
                     self.btn_extract.config(state="normal")
+                    self.lp.stop()
                     messagebox.showinfo("완료", f"MP3 저장이 끝났습니다.\n{payload}")
                 elif kind == "stage":
                     self.stage_var.set(payload)
@@ -1224,10 +1375,11 @@ class App(tk.Tk):
                     idx, status = payload
                     self._set_track_status(idx, status)
                 elif kind == "error":
-                    self._stop_busy("● 오류", payload)
+                    self._stop_busy("✕  오류", payload)
                     self.btn_search.config(state="normal")
                     self.btn_extract.config(state="normal")
                     self.btn_download.config(state="normal")
+                    self.lp.stop()
                     messagebox.showerror("오류", payload)
         except queue.Empty:
             pass
