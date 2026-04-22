@@ -1,1 +1,2 @@
 yt-dlp>=2024.3.10
+customtkinter>=5.2.0

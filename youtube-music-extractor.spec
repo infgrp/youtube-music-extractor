@@ -9,6 +9,7 @@ Inputs:
     vendor/ffmpeg.exe   (not committed; see docs/BUILD.md)
 """
 import os
+from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 
@@ -20,12 +21,16 @@ if not os.path.isfile(ffmpeg_src):
         "before running PyInstaller. See docs/BUILD.md."
     )
 
+# CustomTkinter 는 테마 JSON 과 폰트 파일을 런타임에 로드한다.
+# 일반 import 추적으로는 안 잡히므로 collect_all 로 명시적으로 번들.
+ctk_datas, ctk_binaries, ctk_hiddenimports = collect_all("customtkinter")
+
 a = Analysis(
     ["main.py"],
     pathex=[here],
-    binaries=[(ffmpeg_src, ".")],
-    datas=[],
-    hiddenimports=[],
+    binaries=[(ffmpeg_src, ".")] + ctk_binaries,
+    datas=ctk_datas,
+    hiddenimports=ctk_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
